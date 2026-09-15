@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.7.0';
+our $VERSION = '1.8.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -80,6 +80,7 @@ my %CFG = (
     quic_bpf        => 'off',
     reload_interval => '6h',
     renew_interval  => '12h',
+    renew_retry_interval => '1h',
 );
 
 sub read_kv {
@@ -1603,6 +1604,27 @@ sub cmd_doctor {
     }
 
     say_step 'Подовження сертифікатів';
+    # Стан спільного certbot. Невдалий прогін не видно ніде, крім його
+    # логу: контейнер лишається «Up», просто нічого не робить до
+    # наступного циклу — рівно та тиша, через яку сертифікати й
+    # протермінувалися.
+    if (have_docker()) {
+        if (container_running('certbot')) {
+            my $log = capture('docker', 'logs', '--tail', '50', 'certbot');
+            my @failures = grep { /Another instance of Certbot|Failed to renew/i }
+                           split /\n/, $log;
+            if (@failures) {
+                $soft->('останній прогін спільного certbot завершився помилкою:');
+                $soft->("    $_") for @failures;
+                $soft->('перезапустити: docker compose restart certbot');
+            } else {
+                say_ok 'спільний certbot працює, помилок у свіжому логу немає';
+            }
+        } else {
+            $bad->('спільний контейнер certbot не працює — сертифікати не '
+                 . 'подовжуватимуться. Підняти: dcpmgmt apply');
+        }
+    }
     # Спільний certbot виконує `certbot renew` для всіх сертифікатів одразу,
     # а шлях до webroot кожен сертифікат пам'ятає у своєму renewal-конфізі,
     # записаному при первинній видачі. Якщо шлях не збігається з тим, що ми

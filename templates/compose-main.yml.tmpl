@@ -5,6 +5,10 @@
 #   webserver — єдиний nginx-фронтенд (http/2, http/3, TLS) для всіх доменів;
 #   certbot   — один цикл `certbot renew` на всі сертифікати.
 #
+# Невдалий прогін `certbot renew` чекає {{renew_retry_interval}}, а не
+# {{renew_interval}}: помилка буває тимчасова (зайнятий lock, мережа), і
+# спати після неї півдоби означає втратити півдоби.
+#
 # webserver раз на {{reload_interval}} робить `nginx -s reload`: certbot
 # оновлює сертифікат на диску, але nginx тримає старий у пам'яті до
 # перезавантаження конфігурації — без цього циклу подовжений сертифікат
@@ -50,7 +54,7 @@ services:
       - certbot-etc:/etc/letsencrypt
       - certbot-var:/var/lib/letsencrypt
 {{certbot_volumes}}
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep {{renew_interval}} & wait $${!}; done;'"
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do if certbot renew; then delay={{renew_interval}}; else echo \"certbot renew failed, next try in {{renew_retry_interval}}\" >&2; delay={{renew_retry_interval}}; fi; sleep $$delay & wait $${!}; done;'"
     networks:
       - app-network
 
