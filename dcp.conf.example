@@ -94,3 +94,8 @@ reload_interval = 6h
 
 # Інтервал циклу `certbot renew` у спільному контейнері certbot
 renew_interval = 12h
+
+# Скільки чекати після НЕВДАЛОГО прогону. Помилка часто тимчасова —
+# зайнятий lock у /etc/letsencrypt, недоступна мережа, — і чекати після
+# неї повний renew_interval означає дарма втратити півдоби.
+renew_retry_interval = 1h
