@@ -22,8 +22,10 @@ use File::Path qw(make_path remove_tree);
 use File::Temp qw(tempdir);
 use Cwd qw(abs_path);
 use Getopt::Long qw(GetOptionsFromArray);
+use Digest::SHA qw(hmac_sha512);
+use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.1.0';
+our $VERSION = '1.2.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -69,6 +71,8 @@ my %CFG = (
     tz              => 'Europe/Kiev',
     quic_reuseport_domain => '',
     worker_processes => 'auto',
+    password_mode   => 'derived',
+    master_key_file => '~/.dcp-master-key',
     quic_bpf        => 'off',
     reload_interval => '6h',
     renew_interval  => '12h',
@@ -208,7 +212,7 @@ sub reg_save {
     my $d = $e->{domain};
     make_path(reg_dir()) unless -d reg_dir();
     my @order = qw(type domain target upstream app_service image db_image
-                   db_name db_user php_service http3 enabled note);
+                   db_name db_user php_service password_mode http3 enabled note);
     my $out = "# Реєстр домену $d. Джерело істини для dcpmgmt render.\n"
             . "# Змінили щось руками — виконайте: dcpmgmt render --diff\n";
     for my $k (@order) {
@@ -366,22 +370,109 @@ sub cert_live { my ($d) = @_; -e cert_dir($d) . '/fullchain.pem' }
 
 sub secret_path { my ($d) = @_; "$ROOT/secrets/$d.env" }
 
+# '~' розкривається в домівку ефективного користувача з /etc/passwd, а не
+# з $HOME: під sudo змінна оточення показує на кого завгодно, залежно від
+# налаштувань sudoers, і ключ загубиться в чужій домівці.
+sub master_key_path {
+    my $path = $CFG{master_key_file};
+    $path =~ s{^~(?=/|$)}{ (getpwuid($>))[7] // '/root' }e;
+    return $path;
+}
+
+# Ключ створюється один раз і більше не змінюється: зміна зробить усі
+# виведені паролі невідтворюваними, а в БД вони лишаться старими.
+sub master_key {
+    my $path = master_key_path();
+    unless (-f $path) {
+        open my $urandom, '<:raw', '/dev/urandom' or die_err 'немає /dev/urandom';
+        read $urandom, my $bytes, 48;
+        close $urandom;
+        my $key = encode_base64($bytes, '');
+
+        make_path(dirname($path)) unless -d dirname($path);
+        open my $fh, '>', $path or die_err "не можу створити $path: $!";
+        chmod 0400, $path;
+        print $fh "$key\n";
+        close $fh;
+
+        say_warn "створено майстер-ключ $path (0400).";
+        say_warn 'Це єдине, з чого відновлюються паролі БД усіх майбутніх доменів.';
+        say_warn 'Покладіть копію в менеджер паролів — і НЕ змінюйте цей файл:';
+        say_warn 'зміна зробить уже видані паролі невідтворюваними.';
+    }
+    open my $fh, '<', $path or die_err "не можу прочитати $path: $!";
+    my $key = <$fh>;
+    close $fh;
+    chomp $key;
+    die_err "майстер-ключ $path порожній" unless length $key;
+    return $key;
+}
+
+# HMAC-SHA512(ключ, домен) у base64. '+', '/' і '=' прибираються, щоб
+# пароль лишався тим самим рядком скрізь — у env_file, у healthcheck
+# всередині подвійних лапок, у консолі mariadb.
+#
+# Той самий алгоритм, що й у tools/mkpass — результати мають збігатися.
+sub derived_password {
+    my ($domain) = @_;
+    my $b64 = encode_base64(hmac_sha512($domain, master_key()), '');
+    $b64 =~ tr{+/=}{}d;
+    return substr($b64, 0, 48);
+}
+
+# Непорожній каталог даних = mariadb уже пройшла ініціалізацію і пароль
+# із оточення більше не читає.
+sub db_initialized {
+    my ($domain) = @_;
+    my $dir = "$CFG{sites_root}/$domain/db";
+    return 0 unless -d $dir;
+    opendir my $dh, $dir or return 0;
+    my @entries = grep { !/^\.\.?$/ } readdir $dh;
+    closedir $dh;
+    return scalar @entries;
+}
+
 sub secret_ensure {
     my ($e) = @_;
     my $d    = $e->{domain};
     my $path = secret_path($d);
     return 0 if -f $path;
-    my $pass = random_password();
+
+    my $mode = $e->{password_mode} // $CFG{password_mode};
+
+    # База вже ініціалізована, а файла з паролем немає. Для derived це не
+    # біда — виведемо той самий. Для random вигаданий новий пароль БД не
+    # прийме: MariaDB бере MYSQL_PASSWORD лише при першому старті на
+    # порожньому каталозі. Мовчки створити файл означало б підсунути
+    # робочому сайту помилку автентифікації під виглядом полагодженого.
+    if ($mode ne 'derived' && db_initialized($d)) {
+        say_err "secrets/$d.env немає, а база в $CFG{sites_root}/$d/db вже існує "
+              . 'і знає СТАРИЙ випадковий пароль.';
+        say_err 'Новий тут не допоможе — його БД не прийме. Або відновіть файл із '
+              . 'бекапу, або змініть пароль у самій БД:';
+        say_err "  docker exec -it db-" . sid_of($d) . " mariadb -uroot -p"
+              . '  →  ALTER USER ... IDENTIFIED BY ...';
+        return 0;
+    }
+
+    my $pass = $mode eq 'derived' ? derived_password($d) : random_password();
+
     make_path("$ROOT/secrets") unless -d "$ROOT/secrets";
     chmod 0700, "$ROOT/secrets";
-    write_file($path, secret_body($d, $pass), force => 1, mode => 0600, quiet => 1);
-    say_ok "secrets/$d.env — створено (пароль згенеровано, 48 символів)";
+    write_file($path, secret_body($d, $pass, $mode), force => 1, mode => 0600, quiet => 1);
+    say_ok "secrets/$d.env — створено (пароль: $mode, 48 символів)";
     return 1;
 }
 
 sub secret_body {
-    my ($d, $pass) = @_;
+    my ($d, $pass, $mode) = @_;
+    my $origin = ($mode // 'random') eq 'derived'
+        ? "# Виведено з домену: HMAC-SHA512(майстер-ключ, $d).\n"
+        . "# Відновлюється з ключа: dcpmgmt secrets restore\n"
+        : "# Випадковий, нізвідки не відновлюється. Втратили файл —\n"
+        . "# міняйте пароль у самій БД.\n";
     return "# Пароль БД для $d. Згенеровано dcpmgmt, у git не потрапляє.\n"
+         . $origin
          . "# Підключається через env_file у docker-compose.domains/$d.yml.\n"
          . "# Зміна пароля тут НЕ змінює його в уже ініціалізованій БД —\n"
          . "# спершу ALTER USER у самій MariaDB, потім правка цього файла.\n"
@@ -820,6 +911,7 @@ sub cmd_add {
         $e->{php_service} = 'wordpress-' . sid_of($d);
         $e->{image}     ||= $CFG{wordpress_image};
     }
+    $e->{password_mode} = $CFG{password_mode} if $type eq 'wordpress';
     reg_save($e);
     say_ok "domains/$d.conf — створено";
 
@@ -1068,6 +1160,10 @@ sub cmd_import {
             $e->{db_image} = $yml->{db_image} if $yml->{db_image} && $yml->{db_image} ne $CFG{db_image};
             $e->{db_name}  = $yml->{db_name}  || db_name_of($domain);
             $e->{db_user}  = $yml->{db_user}  || db_user_of($domain);
+            # Успадкований пароль узято з працюючої БД, а не виведено з
+            # ключа. Позначаємо як random, інакше `secrets restore` колись
+            # підсуне БД пароль, якого вона не знає.
+            $e->{password_mode} = 'random';
 
             if ($yml->{password}) {
                 unless (-f secret_path($domain)) {
@@ -1123,6 +1219,60 @@ TXT
 }
 
 # ─────────────────────────── doctor ───────────────────────────
+
+sub cmd_secrets {
+    my @args = @_;
+    my $sub  = shift @args // '';
+    load_config();
+
+    if ($sub eq 'show') {
+        my $d = shift @args or die_err 'потрібен домен: dcpmgmt secrets show <domain>';
+        my $e = reg_load_one($d) or die_err "домену $d немає в реєстрі";
+        my %env = read_kv(secret_path($d));
+        if ($env{mysql_password}) {
+            print "$env{mysql_password}\n";
+        }
+        elsif (($e->{password_mode} // $CFG{password_mode}) eq 'derived') {
+            say_warn "secrets/$d.env немає — показую виведений із ключа";
+            print derived_password($d), "\n";
+        }
+        else {
+            die_err "secrets/$d.env немає, а пароль домену випадковий — відновити нізвідки";
+        }
+    }
+    elsif ($sub eq 'restore') {
+        my ($created, @lost) = (0);
+        for my $e (reg_all()) {
+            next unless $e->{type} eq 'wordpress';
+            my $d = $e->{domain};
+            next if -f secret_path($d);
+            if (($e->{password_mode} // $CFG{password_mode}) ne 'derived') {
+                push @lost, $d;
+                next;
+            }
+            make_path("$ROOT/secrets") unless -d "$ROOT/secrets";
+            chmod 0700, "$ROOT/secrets";
+            write_file(secret_path($d), secret_body($d, derived_password($d), 'derived'),
+                       force => 1, mode => 0600, quiet => 1);
+            say_ok "secrets/$d.env — відновлено з ключа";
+            $created++;
+        }
+        say_ok "відновлено файлів: $created";
+        if (@lost) {
+            say_warn 'пароль випадковий, з ключа не виводиться: ' . join(', ', @lost);
+            say_warn 'для цих доменів пароль доведеться змінити в самій БД:';
+            say_warn "  docker exec -it db-<sid> mariadb -uroot -p  →  ALTER USER ... IDENTIFIED BY ...";
+        }
+    }
+    elsif ($sub eq 'key') {
+        my $path = master_key_path();
+        master_key();                       # створить, якщо його ще немає
+        printf "%s (%s)\n", $path, -f $path ? sprintf('%04o', (stat $path)[2] & 07777) : 'немає';
+    }
+    else {
+        die_err 'dcpmgmt secrets show <domain> | restore | key';
+    }
+}
 
 sub cmd_doctor {
     load_config();
@@ -1214,6 +1364,31 @@ sub cmd_doctor {
               . 'QUIC-з\'єднань між воркерами (dcp.conf: quic_reuseport_domain)');
     }
 
+    say_step 'Паролі';
+    my $key_path = master_key_path();
+    if (-f $key_path) {
+        my $key_mode = sprintf('%04o', (stat $key_path)[2] & 07777);
+        $soft->("майстер-ключ $key_path має права $key_mode, очікується 0400")
+            if $key_mode ne '0400';
+        say_ok "майстер-ключ $key_path ($key_mode)";
+    } else {
+        say_ok "майстер-ключа ще немає — з'явиться при першому derived-паролі";
+    }
+    for my $e (@doms) {
+        next unless $e->{type} eq 'wordpress';
+        next unless ($e->{password_mode} // $CFG{password_mode}) eq 'derived';
+        my $d = $e->{domain};
+        next unless -f secret_path($d) && -f $key_path;
+        my %env = read_kv(secret_path($d));
+        next unless $env{mysql_password};
+        # Розходження означає або підмінений майстер-ключ, або ручну зміну
+        # пароля. Друге законно, перше зробить `secrets restore` шкідливим.
+        $soft->("$d: пароль у secrets/ не збігається з виведеним із ключа. "
+              . 'Змінювали вручну — гаразд; якщо ні, ключ не той, і '
+              . '`secrets restore` підсуне БД чужий пароль')
+            if $env{mysql_password} ne derived_password($d);
+    }
+
     say_step 'QUIC';
     if (quic_bpf_enabled()) {
         $bad->('quic_bpf = on, але nginx/nginx.conf не згенеровано — директива '
@@ -1281,6 +1456,7 @@ dcpmgmt — керування доменами docker web-стека (nginx + W
   dcpmgmt render [--diff] [--force] [<domain>...]   перегенерувати файли
   dcpmgmt apply [--force]               застосувати до працюючого стека
   dcpmgmt cert issue|renew|list [<domain>] [--staging] [--force]
+  dcpmgmt secrets show <domain> | restore | key
 
 Глобальні ключі:  --yes (не питати підтверджень)
 
@@ -1304,6 +1480,7 @@ sub main {
     elsif ($cmd eq 'render')  { cmd_render(@args) }
     elsif ($cmd eq 'apply')   { cmd_apply(@args) }
     elsif ($cmd eq 'cert')    { cmd_cert(@args) }
+    elsif ($cmd eq 'secrets') { cmd_secrets(@args) }
     elsif ($cmd eq 'doctor')  { cmd_doctor(@args) }
     elsif ($cmd eq 'version') { print "dcpmgmt $VERSION\n" }
     elsif ($cmd eq 'help' || $cmd eq '--help' || $cmd eq '-h' || $cmd eq '') { usage() }
