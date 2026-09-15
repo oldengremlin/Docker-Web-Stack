@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.4.0';
+our $VERSION = '1.5.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -212,7 +212,8 @@ sub reg_save {
     my $d = $e->{domain};
     make_path(reg_dir()) unless -d reg_dir();
     my @order = qw(type domain target upstream app_service image db_image
-                   db_name db_user php_service password_mode http3 enabled note);
+                   db_name db_user php_service password_mode extra_env http3
+                   enabled note);
     my $out = "# Реєстр домену $d. Джерело істини для dcpmgmt render.\n"
             . "# Змінили щось руками — виконайте: dcpmgmt render --diff\n";
     for my $k (@order) {
@@ -269,7 +270,10 @@ sub write_file {
     }
     if (defined $old && !$o{force}) {
         if ($o{diff}) {
-            say_info "$rel — відрізняється від згенерованого:";
+            say_info $o{owned_by_admin}
+                ? "$rel — відрізняється від каркаса, але це ВАШ файл: dcpmgmt його "
+                . 'не перезапише навіть із --force. Різниця нижче — довідково:'
+                : "$rel — відрізняється від згенерованого:";
             show_diff($path, $content);
         } elsif ($o{owned_by_admin}) {
             say_info "$rel — ваш файл, dcpmgmt його не чіпає (свіжий каркас: видаліть файл і повторіть render)";
@@ -634,9 +638,24 @@ sub domain_yml_body {
         db_user    => $e->{db_user}  || db_user_of($d),
         upstream   => $e->{upstream} // '',
         app_service=> $e->{app_service} || upstream_host($e->{upstream} // ''),
+        extra_env  => extra_env_lines($e),
     );
     return render_template('domain-wordpress.yml.tmpl', %v) if $e->{type} eq 'wordpress';
     return render_template('domain-proxy.yml.tmpl', %v);
+}
+
+# Додаткові змінні оточення WordPress-контейнера, яких немає в схемі:
+# у реєстрі — рядок "KEY=value, KEY2=value2", у yml — рядки environment.
+# Потрібні для таких речей, як PHP_DISPLAY_ERRORS на сайті в розробці.
+sub extra_env_lines {
+    my ($e) = @_;
+    return '' unless $e->{extra_env};
+    my @lines;
+    for my $pair (split /\s*,\s*/, $e->{extra_env}) {
+        my ($key, $value) = $pair =~ /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/ or next;
+        push @lines, sprintf('      %s: "%s"', $key, $value);
+    }
+    return @lines ? "\n" . join("\n", @lines) : '';
 }
 
 sub upstream_host {
@@ -738,6 +757,20 @@ sub ensure_site_dirs {
     }
 }
 
+# Наявний yml міг обрости змінними оточення руками. Регенерація їх зітре
+# мовчки, а наслідок (сайт поводиться інакше) виявиться геть не одразу.
+sub warn_dropped_env {
+    my ($e, $generated) = @_;
+    my $current = slurp(domain_yml_path($e->{domain})) // return;
+    my %in_new = map { $_ => 1 } $generated =~ /^\s{6}([A-Z_][A-Z0-9_]*):/mg;
+    my @dropped = grep { !$in_new{$_} } $current =~ /^\s{6}([A-Z_][A-Z0-9_]*):/mg;
+    return unless @dropped;
+    say_warn "docker-compose.domains/$e->{domain}.yml: у наявному файлі є змінні, "
+           . 'яких немає в згенерованому: ' . join(', ', @dropped) . '.';
+    say_warn "Щоб не загубити, додайте в domains/$e->{domain}.conf рядок на кшталт:";
+    say_warn '  extra_env   = ' . join(', ', map { "$_=значення" } @dropped);
+}
+
 sub ensure_custom_hooks {
     my ($e) = @_;
     my $d = $e->{domain};
@@ -786,6 +819,7 @@ sub render_all {
             # Файл proxy-домену описує ЧУЖИЙ застосунок і належить адміну:
             # --force регенерує наші шаблони, а не чужу роботу. Щоб отримати
             # свіжий каркас — видаліть файл і повторіть render.
+            warn_dropped_env($e, $yml) if $e->{type} eq 'wordpress';
             my %fo = $e->{type} eq 'proxy' ? (%o, force => 0, owned_by_admin => 1) : %o;
             write_file(domain_yml_path($d), $yml, %fo);
         }
@@ -1233,6 +1267,17 @@ sub parse_domain_yml {
     ($y{db_name})  = $c =~ /MYSQL_DATABASE:\s*(\S+)/;
     ($y{db_user})  = $c =~ /MYSQL_USER:\s*(\S+)/;
     ($y{password}) = $c =~ /MYSQL_PASSWORD:\s*(\S+)/;
+    # Змінні оточення WordPress-сервісу, яких немає в схемі — щоб імпорт
+    # не загубив ручні доповнення на кшталт PHP_DISPLAY_ERRORS.
+    my %known = map { $_ => 1 } qw(WORDPRESS_DB_HOST WORDPRESS_DB_USER
+                                   WORDPRESS_DB_PASSWORD WORDPRESS_DB_NAME
+                                   MYSQL_DATABASE MYSQL_USER MYSQL_PASSWORD
+                                   MYSQL_RANDOM_ROOT_PASSWORD);
+    my @extra;
+    while ($c =~ /^\s{6}([A-Z_][A-Z0-9_]*):\s*"?([^"\n]*?)"?\s*$/mg) {
+        push @extra, "$1=$2" unless $known{$1};
+    }
+    $y{extra_env} = join(', ', @extra) if @extra;
     delete $y{$_} for grep { !defined $y{$_} } keys %y;
     return \%y;
 }
@@ -1267,6 +1312,7 @@ sub cmd_import {
             # ключа. Позначаємо як random, інакше `secrets restore` колись
             # підсуне БД пароль, якого вона не знає.
             $e->{password_mode} = 'random';
+            $e->{extra_env} = $yml->{extra_env} if $yml->{extra_env};
 
             if ($yml->{password}) {
                 unless (-f secret_path($domain)) {
