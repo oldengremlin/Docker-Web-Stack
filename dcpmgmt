@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.8.0';
+our $VERSION = '1.9.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -1725,6 +1725,32 @@ sub cmd_doctor {
     elsif (-f main_nginx_conf_path() && (nginx_uncommented(main_nginx_conf_path()) // '') =~ /quic_bpf\s+on/) {
         $soft->('nginx/nginx.conf вмикає quic_bpf, а dcp.conf каже off — привілеї '
               . 'для bpf() у compose не додаються, nginx може не стартувати');
+    }
+
+    # Каталог інсталяції часто беруть під git заради відкату — і разом зі
+    # станом туди легко заїжджають паролі. Найчастіше не самі secrets/, а
+    # похідні: config.yaml від `docker compose config` містить усі паролі
+    # в розкритому вигляді, конфіги проксійованих застосунків — свої.
+    if (-d "$ROOT/.git") {
+        say_step 'Секрети в git';
+        my @tracked = split /\n/, capture('git', '-C', $ROOT, 'ls-files');
+        my @by_name = grep { m{^secrets/} || $_ eq 'dcp.conf' || $_ eq 'config.yaml'
+                             || /htpasswd/i || /\.(key|pem)$/ } @tracked;
+        # Сам інструмент і шаблони згадують назви змінних без значень —
+        # виключаємо, інакше пошук знаходить власний код.
+        my @by_content = split /\n/, capture('git', '-C', $ROOT, 'grep', '-I', '-l', '-E',
+            '(MYSQL_PASSWORD|WORDPRESS_DB_PASSWORD)[:=] *[^ $]|<password>[^<]',
+            '--', ':!dcpmgmt', ':!templates', ':!docs');
+        my %risky = map { $_ => 1 } @by_name, @by_content;
+        if (%risky) {
+            $soft->('у git відстежуються файли з паролями: ' . join(', ', sort keys %risky));
+            $soft->('прибрати з індексу, лишивши на диску:');
+            $soft->('    git rm --cached ' . join(' ', sort keys %risky));
+            $soft->('потім дописати їх у .gitignore. Якщо репозиторій уже кудись пушили — '
+                  . 'паролі треба вважати скомпрометованими й міняти.');
+        } else {
+            say_ok 'серед відстежуваних git файлів паролів не видно';
+        }
     }
 
     say_step 'Файли без пари';
