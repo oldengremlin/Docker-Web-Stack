@@ -16,7 +16,7 @@ services:
     environment:
       WORDPRESS_DB_HOST: db-{{sid}}
       WORDPRESS_DB_USER: {{db_user}}
-      WORDPRESS_DB_NAME: {{db_name}}
+      WORDPRESS_DB_NAME: {{db_name}}{{extra_env}}
     volumes:
       - wordpress-{{sid}}:/var/www/html/{{domain}}
     depends_on:
