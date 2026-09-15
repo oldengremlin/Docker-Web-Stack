@@ -24,6 +24,33 @@ dcpmgmt add wordpress example.com
 
 Спільних на весь стек сервісів рівно два: `webserver` (nginx) і `certbot`.
 
+```mermaid
+flowchart LR
+    client([Браузер])
+    client -->|"80 · ACME + редірект на 443"| ws
+    client -->|"443 · TLS · HTTP/2 · HTTP/3"| ws
+
+    ws["webserver<br/>єдиний nginx-фронтенд"]
+
+    ws -->|"fastcgi_pass :9000"| wp["wordpress-shopexamplecom<br/>php-fpm"]
+    wp --> db[("db-shopexamplecom<br/>MariaDB")]
+    ws -->|"return 301"| out([інший домен])
+    ws -->|"proxy_pass"| app["незалежний застосунок<br/>ваш контейнер"]
+
+    cb["certbot<br/>renew раз на 12 год"]
+    cb -.->|"/etc/letsencrypt"| ws
+
+    subgraph host["дані на хості"]
+        web[("/var/sites/домен/web")]
+        dbd[("/var/sites/домен/db")]
+    end
+    wp --- web
+    db --- dbd
+```
+
+Redirect-домен не має власного контейнера: nginx віддає `301` сам.
+Proxy-домен має контейнер, але описуєте його ви.
+
 ## Непорушне правило
 
 **На кожен домен — своя структура.** Окремий `server`-блок, окремий
@@ -37,6 +64,31 @@ Let's Encrypt не підтримують wildcard, а спільний vhost п
 
 Джерело істини — **реєстр** `domains/*.conf` і налаштування `dcp.conf`.
 Усе інше з них генерується:
+
+```mermaid
+flowchart TD
+    conf["dcp.conf<br/>налаштування інсталяції"]
+    reg["domains/*.conf<br/>реєстр: тип, призначення, імена БД"]
+    tpl["templates/*.tmpl"]
+    sec["secrets/*.env<br/>паролі, 0600, поза git"]
+
+    conf --> tool["dcpmgmt render"]
+    reg --> tool
+    tpl --> tool
+
+    tool --> root["docker-compose.yml"]
+    tool --> main["docker-compose.main.yml"]
+    tool --> dom["docker-compose.domains/*.yml"]
+    tool --> ngx["nginx/nginx-домен.conf"]
+
+    sec -.->|"env_file"| dom
+    cust["nginx/custom/домен.conf<br/>ваші правки"] -.->|"include"| ngx
+
+    tool --> apply["dcpmgmt apply<br/>звіт про наслідки → docker compose up -d"]
+    root --> apply
+    main --> apply
+    dom --> apply
+```
 
 ```
 dcp.conf                      налаштування інсталяції (поза git)
@@ -222,8 +274,16 @@ tools/backup.sh          # BAK/0 — свіжий, BAK/9 — найстаріш�
 
 ---
 
+## Версії
+
+`dcpmgmt version` показує версію інструмента. Кожна зміна коду
+супроводжується підняттям версії і записом у
+[CHANGELOG.md](CHANGELOG.md) — там видно, що саме змінилось між
+випусками й чи потрібні ручні дії при оновленні.
+
 ## Документація
 
+* [CHANGELOG.md](CHANGELOG.md) — що змінювалось.
 * [docs/troubleshooting.md](docs/troubleshooting.md) — граблі, зібрані на
   бойовому сервері, і що робити, коли щось не так.
 * [docs/wordpress-migration.md](docs/wordpress-migration.md) — перенесення

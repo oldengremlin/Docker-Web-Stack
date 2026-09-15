@@ -23,7 +23,7 @@ use File::Temp qw(tempdir);
 use Cwd qw(abs_path);
 use Getopt::Long qw(GetOptionsFromArray);
 
-our $VERSION = '1.0';
+our $VERSION = '1.0.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -119,40 +119,58 @@ sub sid_of {
     return $s;
 }
 
+# Суфікс для обрізаних імен: потрібен лише для унікальності, не для
+# криптографії. Digest::MD5 є в core perl, але якщо збірка без нього —
+# контрольної суми рядка вистачить для тієї ж мети.
 sub md5_hex_of {
-    my ($s) = @_;
-    # Digest::MD5 є в core perl; але не робимо його обов'язковим
-    eval { require Digest::MD5; 1 } or return substr(sprintf('%08x', unpack('%32C*', $s)), 0, 8);
-    return substr(Digest::MD5::md5_hex($s), 0, 8);
+    my ($value) = @_;
+    eval { require Digest::MD5; 1 }
+        or return substr(sprintf('%08x', unpack('%32C*', $value)), 0, 8);
+    return substr(Digest::MD5::md5_hex($value), 0, 8);
 }
 
+# Ліміт імені бази — 64 символи, імені користувача — 32 (MySQL; MariaDB
+# щедріша, але тримаємось меншого). Довші домени обрізаємо й доліплюємо
+# суфікс, щоб два схожі домени не отримали однакове ім'я.
 sub db_name_of {
     my ($domain) = @_;
-    my $n = sid_of($domain);
-    return length($n) <= 64 ? $n : substr($n, 0, 55) . '_' . md5_hex_of($domain);
+    my $name = sid_of($domain);
+    return length($name) <= 64 ? $name : substr($name, 0, 55) . '_' . md5_hex_of($domain);
 }
 
 sub db_user_of {
     my ($domain) = @_;
-    my $u = 'u' . sid_of($domain);
-    return length($u) <= 32 ? $u : substr($u, 0, 23) . '_' . md5_hex_of($domain);
+    my $user = 'u' . sid_of($domain);
+    return length($user) <= 32 ? $user : substr($user, 0, 23) . '_' . md5_hex_of($domain);
 }
 
 sub random_password {
-    my $n = 48;
-    my @alphabet = ('A'..'Z', 'a'..'z', 0..9);
+    my $length   = 48;
+    my @alphabet = ('A'..'Z', 'a'..'z', 0..9);   # 62 символи
+
+    # Байти, що не діляться націло на розмір алфавіту, відкидаємо, а не
+    # беремо за модулем: 256 % 62 = 8, тож перші вісім символів алфавіту
+    # інакше випадали б частіше за решту.
+    my $limit = int(256 / @alphabet) * @alphabet;
+
     open my $fh, '<:raw', '/dev/urandom' or die_err 'немає /dev/urandom';
-    read $fh, my $buf, $n * 2;
+    my $password = '';
+    while (length($password) < $length) {
+        read $fh, my $buf, $length or die_err 'не читається /dev/urandom';
+        $password .= $alphabet[$_ % @alphabet] for grep { $_ < $limit } unpack 'C*', $buf;
+    }
     close $fh;
-    my $p = '';
-    $p .= $alphabet[$_ % scalar @alphabet] for unpack 'C*', $buf;
-    return substr($p, 0, $n);
+    return substr($password, 0, $length);
 }
 
+# Тільки нижній регістр і мінімум одна крапка. Кирилиця не приймається
+# свідомо: ім'я домену стає іменем каталогу, контейнера й бази, тож
+# інтернаціоналізовані домени подаються в punycode (xn--...), як вони й
+# записані в наявному стеку.
 sub valid_domain {
-    my ($d) = @_;
-    return 0 if length($d) > 253;
-    return $d =~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+    my ($domain) = @_;
+    return 0 if length($domain) > 253;
+    return $domain =~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
 }
 
 # ─────────────────────────── реєстр ───────────────────────────
@@ -250,8 +268,10 @@ sub write_file {
         if (open my $bh, '>:encoding(UTF-8)', $bak) { print $bh $old; close $bh; chmod 0600, $bak; }
     }
     open my $fh, '>:encoding(UTF-8)', $path or die_err "не можу писати $path: $!";
-    chmod($o{mode}, $path) if $o{mode};   # до запису: інакше секрет устигає
-    print $fh $content;                   # полежати з правами 0644
+    # Права виставляються до запису вмісту: інакше файл із паролем устигає
+    # полежати з дефолтними 0644 рівно стільки, скільки триває print.
+    chmod($o{mode}, $path) if $o{mode};
+    print $fh $content;
     close $fh;
     say_ok(defined $old ? "$rel — оновлено" : "$rel — створено") unless $o{quiet};
     return defined $old ? 'updated' : 'created';
@@ -271,9 +291,17 @@ sub show_diff {
 sub render_template {
     my ($name, %vars) = @_;
     my $path = "$ROOT/templates/$name";
-    my $t = slurp($path) or die_err "немає шаблону $path";
-    $t =~ s/\{\{(\w+)\}\}/ defined $vars{$1} ? $vars{$1} : "{{$1}}" /ge;
-    return $t;
+    my $template = slurp($path) or die_err "немає шаблону $path";
+    my %missing;
+    $template =~ s/\{\{(\w+)\}\}/
+        defined $vars{$1} ? $vars{$1} : do { $missing{$1} = 1; "{{$1}}" }
+    /ge;
+    # Незаповнений плейсхолдер лишається в тексті й дійде до nginx або
+    # compose як сміття. Не вбиваємо генерацію, але кажемо вголос, бо
+    # інакше причину шукатимуть у повідомленні nginx, а не в шаблоні.
+    say_warn "шаблон $name: не заповнено " . join(', ', map { "{{$_}}" } sort keys %missing)
+        if %missing;
+    return $template;
 }
 
 # ─────────────────────────── docker ───────────────────────────
@@ -290,6 +318,9 @@ sub run_or_die {
     run(@cmd) or die_err "команда завершилась помилкою: @cmd";
 }
 
+# Вивід команди без запуску шелла (аргументи можуть містити що завгодно).
+# stderr глушиться навмисно: docker пише туди попередження, які інакше
+# потраплять у розбір як дані.
 sub capture {
     my (@cmd) = @_;
     my $pid = open(my $fh, '-|');
@@ -484,6 +515,8 @@ sub compose_main_body {
         certbot_volumes   => join("\n", @cbvol),
     );
     my $body = render_template('compose-main.yml.tmpl', %v);
+    # Порожній {{webserver_depends}} (стек без жодного контейнерного домену)
+    # лишає по собі зайвий порожній рядок посеред YAML.
     $body =~ s/\n\n+/\n\n/g;
     return $body;
 }
@@ -517,10 +550,11 @@ sub ensure_site_dirs {
 
 sub render_all {
     my (%o) = @_;
-    my @doms = reg_enabled();
+    my @all  = reg_enabled();
     my %only = map { $_ => 1 } @{ $o{only} || [] };
-    @doms = grep { $only{$_->{domain}} } @doms if %only;
-    my @all = reg_enabled();
+    # Файли генеруються для @doms (можливо, одного домену), а зведені
+    # docker-compose.yml і .main.yml — завжди для всього реєстру.
+    my @doms = %only ? grep { $only{$_->{domain}} } @all : @all;
 
     for my $e (@doms) {
         my $d = $e->{domain};
