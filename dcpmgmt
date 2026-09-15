@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.6.0';
+our $VERSION = '1.6.1';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -1239,6 +1239,24 @@ sub service_hashes {
     return \%h;
 }
 
+# Хеш конфігурації, з яким кожен контейнер був СТВОРЕНИЙ — compose пише
+# його в мітку і саме з ним звіряється, вирішуючи, чи перестворювати.
+# Порівнювати треба з ним, а не з попереднім станом файлів: якщо файли
+# перегенерували раніше й окремо, різниця «до/після» буде нульова, а
+# контейнери все одно поїдуть на перестворення.
+sub running_service_hashes {
+    return {} unless have_docker();
+    my $out = capture('docker', 'ps', '-a',
+        '--filter', "label=com.docker.compose.project=$CFG{project}",
+        '--format', '{{.Label "com.docker.compose.service"}} {{.Label "com.docker.compose.config-hash"}}');
+    my %hashes;
+    for my $line (split /\n/, $out) {
+        my ($service, $hash) = $line =~ /^(\S+)\s+(\S+)$/ or next;
+        $hashes{$service} = $hash;
+    }
+    return \%hashes;
+}
+
 sub report_impact {
     my ($before, $after) = @_;
     return 0 unless %$before || %$after;
@@ -1269,11 +1287,17 @@ sub cmd_apply {
     GetOptionsFromArray(\@args, 'force' => \$force) or die_err 'невідомий ключ';
     load_config();
 
-    my $before = service_hashes();
+    my $running = running_service_hashes();
     say_step 'Генерація конфігурації з реєстру';
     render_all(force => $force);
-    my $after = service_hashes();
-    report_impact($before, $after);
+    my $desired = service_hashes();
+
+    if (%$running) {
+        report_impact($running, $desired);
+    } else {
+        say_step 'Що зробить apply з контейнерами';
+        say_info 'стек не запущено — підніметься все, що описано в конфігурації';
+    }
 
     unless (confirm('Застосувати до працюючого стека?')) { say_info 'скасовано'; return }
     preflight_nginx(reg_enabled());
