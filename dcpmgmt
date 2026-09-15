@@ -25,10 +25,11 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.6.1';
+our $VERSION = '1.6.2';
 
 my $ROOT = dirname(abs_path($0));
 
+binmode STDIN,  ':encoding(UTF-8)';
 binmode STDOUT, ':encoding(UTF-8)';
 binmode STDERR, ':encoding(UTF-8)';
 
@@ -47,13 +48,16 @@ sub say_err  { print c('1;31', 'помилка'), " @_\n"; }
 
 my $YES = 0;
 sub confirm {
-    my ($q) = @_;
+    my ($question) = @_;
     return 1 if $YES;
-    print c('1;33', ' ? '), " $q [так/ні]: ";
-    my $a = <STDIN>;
-    return 0 unless defined $a;
-    chomp $a;
-    return $a =~ /^(так|yes|y)$/i;
+    print c('1;33', ' ? '), " $question [так/ні]: ";
+    my $answer = <STDIN>;
+    return 0 unless defined $answer;
+    $answer =~ s/^\s+|\s+$//g;
+    return 1 if $answer =~ /^(так|т|yes|y)$/i;
+    return 0 if $answer =~ /^(ні|н|no|n|)$/i;
+    say_warn "не зрозумів відповідь '$answer' — вважаю за відмову";
+    return 0;
 }
 
 # ─────────────────────────── конфіг ───────────────────────────
