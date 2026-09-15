@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.5.1';
+our $VERSION = '1.6.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -246,6 +246,43 @@ sub nginx_server_names {
     return sort keys %names;
 }
 
+# Набір директив конфіга, без огляду на порядок і форматування. Потрібен,
+# щоб відповісти на єдине питання, яке справді хвилює при регенерації:
+# чи не зникає щось назовсім. Текстовий diff на це не відповідає —
+# директива, що переїхала на двадцять рядків нижче, виглядає в ньому як
+# видалена, і в тисячі рядків різниці це не перевіриш оком.
+#
+# Евристика: назва + аргументи до ';' або '{'. Для звірки двох версій
+# одного конфіга цього досить.
+sub nginx_directives {
+    my ($text) = @_;
+    return {} unless defined $text;
+    $text =~ s/(^|\s)#[^\n]*//g;
+    my %found;
+    while ($text =~ /([a-z_][a-z_0-9]*)([^;{}]*)([;{])/g) {
+        my ($name, $args) = ($1, $2);
+        next if $name =~ /^(server|http|events)$/;
+        $args =~ s/\s+/ /g;
+        $args =~ s/^ | $//g;
+        $found{ length $args ? "$name $args" : $name } = 1;
+    }
+    return \%found;
+}
+
+# Директиви, які є в наявному конфізі й зникають у згенерованому.
+sub report_lost_directives {
+    my ($path, $generated) = @_;
+    my $current = slurp($path) // return;
+    my $have = nginx_directives($generated);
+    my @lost = sort grep { !$have->{$_} } keys %{ nginx_directives($current) };
+    unless (@lost) {
+        say_ok basename($path) . ' — жодної директиви не втрачено (решта різниці — порядок і форматування)';
+        return;
+    }
+    say_warn basename($path) . ' — зникають директиви:';
+    say_warn "    $_" for @lost;
+}
+
 sub slurp {
     my ($p) = @_;
     open my $fh, '<:encoding(UTF-8)', $p or return undef;
@@ -441,6 +478,17 @@ sub preflight_nginx {
           . "       сайти живі зі старою конфігурацією в пам'яті.\n"
           . "       Якщо помилка про 'host not found in upstream' — перевірте, чи підняті\n"
           . '       контейнери доменів: на зупинених ця перевірка дає хибну тривогу.';
+}
+
+# Версія WordPress, яка реально лежить у web/. Сайт оновлює себе сам, тож
+# вона розходиться з тегом образу — а тег вирішує, що розгорнеться, якщо
+# каталог колись відновлять порожнім.
+sub wp_installed_version {
+    my ($domain) = @_;
+    my $version_file = "$CFG{sites_root}/$domain/web/wp-includes/version.php";
+    my $content = slurp($version_file) // return undef;
+    my ($version) = $content =~ /\$wp_version\s*=\s*'([^']+)'/;
+    return $version;
 }
 
 sub cert_dir  { my ($d) = @_; "$CFG{letsencrypt_dir}/etc/live/$d" }
@@ -817,7 +865,10 @@ sub render_all {
         secret_ensure($e) if $e->{type} eq 'wordpress';
 
         ensure_custom_hooks($e);
-        write_file(nginx_conf_path($d), nginx_conf_body($e), %o);
+        my $nginx_conf = nginx_conf_body($e);
+        report_lost_directives(nginx_conf_path($d), $nginx_conf)
+            if $o{diff} && -f nginx_conf_path($d);
+        write_file(nginx_conf_path($d), $nginx_conf, %o);
         if ($e->{type} eq 'redirect') {
             my $idx = "$CFG{sites_root}/$d/web/index.html";
             write_file($idx, render_template('redirect-index.html.tmpl', target => $e->{target}), %o)
@@ -1492,6 +1543,17 @@ sub cmd_doctor {
                 $soft->("secrets/$d.env має права " . sprintf('%04o', $mode & 07777) . ', очікується 0600')
                     if ($mode & 07777) != 0600;
             }
+            # Тег образу і встановлена версія розходяться самі собою: WordPress
+            # оновлюється через власний апдейтер, а тег лишається старим.
+            # Наявним файлам це не шкодить (entrypoint не чіпає непорожній
+            # каталог), але порожній каталог отримає версію з тега.
+            my $installed = wp_installed_version($d);
+            my ($tagged) = ($e->{image} // '') =~ /^wordpress:(\d+(?:\.\d+)*)/;
+            $soft->("$d: у web/ стоїть WordPress $installed, а образ у реєстрі — "
+                  . "$e->{image}. Робочому сайту це не шкодить, але після "
+                  . 'відновлення порожнього web/ розгорнеться версія з тега')
+                if $installed && $tagged && index($installed, $tagged) != 0;
+
             my $php = $e->{php_service} // '';
             $soft->("$d: PHP іде на '$php', який уже обслуговує $php_seen{$php} — copy-paste на чужий сайт?")
                 if $php && $php_seen{$php};
