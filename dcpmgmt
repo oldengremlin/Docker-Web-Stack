@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.2.0';
+our $VERSION = '1.3.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -786,8 +786,9 @@ sub cert_issue {
 sub cmd_cert {
     my @args = @_;
     my $sub = shift @args // '';
-    my ($staging, $force) = (0, 0);
-    GetOptionsFromArray(\@args, 'staging' => \$staging, 'force' => \$force)
+    my ($staging, $force, $dry_run) = (0, 0, 0);
+    GetOptionsFromArray(\@args, 'staging' => \$staging, 'force' => \$force,
+                        'dry-run' => \$dry_run)
         or die_err 'невідомий ключ';
     my $d = shift @args;
 
@@ -808,10 +809,14 @@ sub cmd_cert {
                 '-v', "$CFG{sites_root}/$dom/web:/var/www/html/$dom",
                 $CFG{certbot_image}, 'renew', '--cert-name', $dom,
             );
+            # --dry-run ходить на тестовий сервер і нічого не записує:
+            # єдиний спосіб перевірити, чи подовження взагалі пройде, не
+            # витрачаючи лімітів Let's Encrypt.
+            push @cmd, '--dry-run'       if $dry_run;
             push @cmd, '--force-renewal' if $force;
             run(@cmd) or say_warn "renew для $dom завершився помилкою";
         }
-        nginx_test_reload();
+        nginx_test_reload() unless $dry_run;
     }
     elsif ($sub eq 'list') {
         for my $e (reg_all()) {
@@ -820,8 +825,18 @@ sub cmd_cert {
         }
     }
     else {
-        die_err 'dcpmgmt cert issue|renew|list [<domain>] [--staging] [--force]';
+        die_err 'dcpmgmt cert issue|renew|list [<domain>] [--staging] [--force] [--dry-run]';
     }
+}
+
+# `openssl x509 -checkend` замість розбору дати: сам вміє порівнювати з
+# поточним часом і не залежить від локалі й формату notAfter.
+sub cert_expires_within {
+    my ($domain, $seconds) = @_;
+    my $pem = cert_dir($domain) . '/cert.pem';
+    return 0 unless -e $pem;
+    return system('openssl', 'x509', '-checkend', $seconds, '-noout',
+                  '-in', $pem) != 0;
 }
 
 sub cert_expiry {
@@ -1301,6 +1316,10 @@ sub cmd_doctor {
         push @p, 'немає nginx-конфіга'         unless -f nginx_conf_path($d);
         push @p, "немає каталогу $CFG{sites_root}/$d/web" unless -d "$CFG{sites_root}/$d/web";
         push @p, 'немає сертифіката'           unless cert_live($d);
+        # Протермінований сертифікат — це зламаний сайт просто зараз:
+        # браузер показує попередження замість сторінки.
+        push @p, 'сертифікат ПРОТЕРМІНОВАНО (' . (cert_expiry($d) // '') . ')'
+            if cert_live($d) && cert_expires_within($d, 0);
         if ($e->{type} eq 'wordpress') {
             push @p, "немає каталогу БД $CFG{sites_root}/$d/db" unless -d "$CFG{sites_root}/$d/db";
             push @p, 'немає secrets/' . "$d.env" unless -f secret_path($d);
@@ -1319,6 +1338,12 @@ sub cmd_doctor {
         $soft->("$d: docker-compose.domains/$d.yml ще з CHANGE-ME — опишіть сервіс "
               . 'застосунку, інакше домен лишається поза стеком')
             if $e->{type} eq 'proxy' && -f domain_yml_path($d) && !domain_yml_ready($d);
+
+        # Let's Encrypt подовжує за 30 днів до кінця; якщо лишилось менше
+        # двох тижнів, автоматика вже мала спрацювати і не спрацювала.
+        $soft->("$d: сертифікат спливає менш ніж за 14 днів (" . (cert_expiry($d) // '')
+              . ') — автоматичне подовження не спрацювало, розберіться зараз')
+            if cert_live($d) && !cert_expires_within($d, 0) && cert_expires_within($d, 14 * 24 * 3600);
 
         if (@p) { $bad->("$d: $_") for @p }
         else    { printf "  %s %-34s %s\n", c('1;32', '  ok  '), $d, cert_expiry($d) // '' }
@@ -1339,8 +1364,14 @@ sub cmd_doctor {
         }
         my $c = slurp($rc) // next;
         my ($auth) = $c =~ /^authenticator\s*=\s*(\S+)/m;
-        $soft->("$d: authenticator=$auth, а не webroot — подовження піде іншим шляхом, "
-              . 'перевірте вручну')
+        # certbot renew повторює той спосіб перевірки, яким сертифікат
+        # видали. `manual` означає, що challenge колись проходили руками,
+        # і без --manual-auth-hook renew його просто не виконає: сертифікат
+        # тихо доживе до кінця терміну.
+        $bad->("$d: у renewal-конфізі authenticator=$auth, а не webroot. "
+             . "Автоматичне подовження НЕ працює.\n"
+             . "       Полагодити — перевидати через webroot, це перепише конфіг:\n"
+             . "       dcpmgmt cert issue $d --force")
             if $auth && $auth ne 'webroot';
         my @paths = $c =~ /^webroot_path\s*=\s*(.+)$/m ? split(/\s*,\s*/, $1) : ();
         push @paths, ($c =~ /^\Q$d\E\s*=\s*(\S+)/m ? $1 : ());
@@ -1455,7 +1486,7 @@ dcpmgmt — керування доменами docker web-стека (nginx + W
   dcpmgmt doctor                        перевірити узгодженість усього
   dcpmgmt render [--diff] [--force] [<domain>...]   перегенерувати файли
   dcpmgmt apply [--force]               застосувати до працюючого стека
-  dcpmgmt cert issue|renew|list [<domain>] [--staging] [--force]
+  dcpmgmt cert issue|renew|list [<domain>] [--staging] [--force] [--dry-run]
   dcpmgmt secrets show <domain> | restore | key
 
 Глобальні ключі:  --yes (не питати підтверджень)
