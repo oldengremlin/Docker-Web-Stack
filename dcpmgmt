@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.9.0';
+our $VERSION = '1.9.1';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -1736,11 +1736,16 @@ sub cmd_doctor {
         my @tracked = split /\n/, capture('git', '-C', $ROOT, 'ls-files');
         my @by_name = grep { m{^secrets/} || $_ eq 'dcp.conf' || $_ eq 'config.yaml'
                              || /htpasswd/i || /\.(key|pem)$/ } @tracked;
-        # Сам інструмент і шаблони згадують назви змінних без значень —
-        # виключаємо, інакше пошук знаходить власний код.
+        # Шукаємо присвоєння з правдоподібним значенням, а не саму згадку
+        # назви: рядки на кшталт awk '/"MYSQL_PASSWORD=/ { … }' у скриптах
+        # розбору — це шаблон пошуку, а не пароль. Тому після роздільника
+        # вимагається щонайменше вісім символів, з яких складаються паролі.
+        my $secret_pattern =
+            q{(MYSQL_PASSWORD|WORDPRESS_DB_PASSWORD)[:=] *["']?[A-Za-z0-9+/=_.-]{8,}}
+          . q{|<password>[A-Za-z0-9+/=_.-]{8,}};
+        # Сам інструмент і шаблони згадують назви змінних без значень.
         my @by_content = split /\n/, capture('git', '-C', $ROOT, 'grep', '-I', '-l', '-E',
-            '(MYSQL_PASSWORD|WORDPRESS_DB_PASSWORD)[:=] *[^ $]|<password>[^<]',
-            '--', ':!dcpmgmt', ':!templates', ':!docs');
+            $secret_pattern, '--', ':!dcpmgmt', ':!templates', ':!docs');
         my %risky = map { $_ => 1 } @by_name, @by_content;
         if (%risky) {
             $soft->('у git відстежуються файли з паролями: ' . join(', ', sort keys %risky));
