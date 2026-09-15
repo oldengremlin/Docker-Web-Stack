@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.3.0';
+our $VERSION = '1.4.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -234,6 +234,17 @@ sub nginx_uncommented {
     return $c;
 }
 
+# Усі імена з директив server_name у конфізі домену.
+sub nginx_server_names {
+    my ($path) = @_;
+    my $conf = nginx_uncommented($path) // return ();
+    my %names;
+    while ($conf =~ /^\s*server_name\s+([^;]+);/mg) {
+        $names{$_} = 1 for grep { length } split /\s+/, $1;
+    }
+    return sort keys %names;
+}
+
 sub slurp {
     my ($p) = @_;
     open my $fh, '<:encoding(UTF-8)', $p or return undef;
@@ -319,6 +330,22 @@ sub run {
     return $rc == 0;
 }
 
+# Як run(), але без жодного виводу: потрібен тільки код повернення.
+# Без shell, щоб аргументи не інтерпретувалися.
+sub run_quiet {
+    my (@cmd) = @_;
+    my $pid = fork();
+    die_err "fork: $!" unless defined $pid;
+    unless ($pid) {
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+        exec @cmd;
+        exit 127;
+    }
+    waitpid $pid, 0;
+    return $? == 0;
+}
+
 sub run_or_die {
     my (@cmd) = @_;
     run(@cmd) or die_err "команда завершилась помилкою: @cmd";
@@ -361,6 +388,51 @@ sub nginx_test_reload {
     run_or_die('docker', 'exec', 'webserver', 'nginx', '-s', 'reload');
     say_ok 'nginx перезавантажено';
     return 1;
+}
+
+# Перевірка згенерованої конфігурації в одноразовому контейнері — ДО того,
+# як чіпати робочий webserver. Той самий образ і ті самі монти, але окремий
+# контейнер: якщо конфіг зламаний, робочий nginx про це не дізнається і
+# далі крутиться зі старим у пам'яті.
+#
+# Має сенс лише поки стек працює: на зупиненому впаде резолв upstream-імен,
+# і це буде хибна тривога. Зупинений стек нічим і не ризикує — зламаний
+# конфіг просто не дасть йому піднятись.
+sub preflight_nginx {
+    my (@doms) = @_;
+    return 1 unless have_docker() && container_running('webserver');
+
+    my $network = "$CFG{project}_app-network";
+    unless (grep { $_ eq $network } split /\n/, capture('docker', 'network', 'ls', '--format', '{{.Name}}')) {
+        say_warn "мережі $network немає — перевірку конфігурації пропущено";
+        return 1;
+    }
+
+    my @mounts = (
+        "$CFG{nginx_conf_dir}:/etc/nginx/conf.d",
+        "$ROOT/nginx/custom:/etc/nginx/custom:ro",
+        "$CFG{letsencrypt_dir}/etc:/etc/letsencrypt:ro",
+    );
+    push @mounts, main_nginx_conf_path() . ':/etc/nginx/nginx.conf:ro' if -f main_nginx_conf_path();
+    for my $e (@doms) {
+        my $d = $e->{domain};
+        push @mounts, "$ROOT/nginx/nginx-$d.conf:/etc/nginx/conf.d/$d.conf:ro";
+        push @mounts, "$CFG{sites_root}/$d/web:/var/www/html/$d:ro";
+    }
+
+    say_step 'Перевірка згенерованої конфігурації в одноразовому контейнері';
+    # --entrypoint nginx в обхід docker-entrypoint.sh: той правив би файли
+    # у змонтованому conf.d, тобто в каталозі проєкту на хості.
+    my @cmd = ('docker', 'run', '--rm', '--entrypoint', 'nginx', '--network', $network);
+    push @cmd, map { ('-v', $_) } @mounts;
+    push @cmd, $CFG{nginx_image}, '-t';
+
+    return 1 if run(@cmd);
+
+    die_err "згенерована конфігурація не проходить nginx -t. Робочий webserver НЕ чіпали,\n"
+          . "       сайти живі зі старою конфігурацією в пам'яті.\n"
+          . "       Якщо помилка про 'host not found in upstream' — перевірте, чи підняті\n"
+          . '       контейнери доменів: на зупинених ця перевірка дає хибну тривогу.';
 }
 
 sub cert_dir  { my ($d) = @_; "$CFG{letsencrypt_dir}/etc/live/$d" }
@@ -666,6 +738,29 @@ sub ensure_site_dirs {
     }
 }
 
+sub ensure_custom_hooks {
+    my ($e) = @_;
+    my $d = $e->{domain};
+    for my $hook ("$ROOT/nginx/custom/$d.conf",
+                  ($e->{type} eq 'wordpress' ? "$ROOT/nginx/custom/$d.php.conf" : ())) {
+        next if -f $hook;
+        write_file($hook,
+            "# Правки для $d, які переживають `dcpmgmt render --force`.\n"
+          . "# Цей файл dcpmgmt не перезаписує ніколи. Порожній — це нормально.\n",
+            quiet => 1);
+    }
+}
+
+# Лише nginx-конфіг одного домену. Після видачі сертифіката треба замінити
+# :80-заглушку на бойовий конфіг — і більше нічого: перебудовувати
+# compose-файли всього стека заради сертифіката одного домену означає
+# підсунути під працюючі контейнери зміни, яких ніхто не просив.
+sub render_domain_nginx {
+    my ($e, %o) = @_;
+    ensure_custom_hooks($e);
+    write_file(nginx_conf_path($e->{domain}), nginx_conf_body($e), %o);
+}
+
 sub render_all {
     my (%o) = @_;
     my @all  = reg_enabled();
@@ -679,15 +774,7 @@ sub render_all {
         ensure_site_dirs($e) unless $o{no_dirs};
         secret_ensure($e) if $e->{type} eq 'wordpress';
 
-        for my $hook ("$ROOT/nginx/custom/$d.conf",
-                      ($e->{type} eq 'wordpress' ? "$ROOT/nginx/custom/$d.php.conf" : ())) {
-            next if -f $hook;
-            write_file($hook,
-                "# Правки для $d, які переживають `dcpmgmt render --force`.\n"
-              . "# Цей файл dcpmgmt не перезаписує ніколи. Порожній — це нормально.\n",
-                quiet => 1);
-        }
-
+        ensure_custom_hooks($e);
         write_file(nginx_conf_path($d), nginx_conf_body($e), %o);
         if ($e->{type} eq 'redirect') {
             my $idx = "$CFG{sites_root}/$d/web/index.html";
@@ -785,6 +872,7 @@ sub cert_issue {
 
 sub cmd_cert {
     my @args = @_;
+    load_config();
     my $sub = shift @args // '';
     my ($staging, $force, $dry_run) = (0, 0, 0);
     GetOptionsFromArray(\@args, 'staging' => \$staging, 'force' => \$force,
@@ -794,9 +882,9 @@ sub cmd_cert {
 
     if ($sub eq 'issue') {
         die_err 'потрібен домен: dcpmgmt cert issue <domain>' unless $d;
-        die_err "домену $d немає в реєстрі" unless reg_load_one($d);
+        my $e = reg_load_one($d) or die_err "домену $d немає в реєстрі";
         cert_issue($d, staging => $staging, force => $force);
-        render_all(force => 1, only => [$d]);
+        render_domain_nginx($e, force => 1);
         nginx_test_reload();
     }
     elsif ($sub eq 'renew') {
@@ -835,8 +923,7 @@ sub cert_expires_within {
     my ($domain, $seconds) = @_;
     my $pem = cert_dir($domain) . '/cert.pem';
     return 0 unless -e $pem;
-    return system('openssl', 'x509', '-checkend', $seconds, '-noout',
-                  '-in', $pem) != 0;
+    return !run_quiet('openssl', 'x509', '-checkend', $seconds, '-noout', '-in', $pem);
 }
 
 sub cert_expiry {
@@ -1095,6 +1182,7 @@ sub cmd_apply {
     report_impact($before, $after);
 
     unless (confirm('Застосувати до працюючого стека?')) { say_info 'скасовано'; return }
+    preflight_nginx(reg_enabled());
     compose('up', '-d', '--remove-orphans') or die_err 'docker compose up завершився помилкою';
     nginx_test_reload();
     say_ok 'готово';
@@ -1309,17 +1397,37 @@ sub cmd_doctor {
     }
 
     say_step 'Домени';
-    my %php_seen;
+    my (%php_seen, %name_owner);
     for my $e (@doms) {
         my $d = $e->{domain};
         my @p;
         push @p, 'немає nginx-конфіга'         unless -f nginx_conf_path($d);
         push @p, "немає каталогу $CFG{sites_root}/$d/web" unless -d "$CFG{sites_root}/$d/web";
         push @p, 'немає сертифіката'           unless cert_live($d);
+
+        # Конфіг, у якому server_name не збігається з доменом — типовий
+        # наслідок copy-paste сусіднього файла. Домен просто не потрапляє
+        # в цей server-блок: запити йдуть у vhost за замовчуванням, а
+        # acme-challenge віддає 404, тож сертифікат мовчки не подовжується.
+        if (-f nginx_conf_path($d)) {
+            my @names = nginx_server_names(nginx_conf_path($d));
+            push @p, "server_name у конфізі — '" . join(' ', @names) . "', а не $d. "
+                   . 'Домен не обслуговується цим блоком: запити йдуть у vhost за '
+                   . 'замовчуванням, acme-challenge віддає 404 і сертифікат не '
+                   . "подовжується. Полагодити: dcpmgmt render --force $d"
+                if @names && !grep { $_ eq $d } @names;
+            for my $name (@names) {
+                $soft->("server_name '$name' оголошено і в nginx-$d.conf, і в "
+                      . "nginx-$name_owner{$name}.conf — nginx візьме перший за абеткою")
+                    if $name_owner{$name} && $name_owner{$name} ne $d;
+                $name_owner{$name} //= $d;
+            }
+        }
+        my $expired  = cert_live($d) && cert_expires_within($d, 0);
+        my $expiring = cert_live($d) && !$expired && cert_expires_within($d, 14 * 24 * 3600);
         # Протермінований сертифікат — це зламаний сайт просто зараз:
         # браузер показує попередження замість сторінки.
-        push @p, 'сертифікат ПРОТЕРМІНОВАНО (' . (cert_expiry($d) // '') . ')'
-            if cert_live($d) && cert_expires_within($d, 0);
+        push @p, 'сертифікат ПРОТЕРМІНОВАНО (' . (cert_expiry($d) // '') . ')' if $expired;
         if ($e->{type} eq 'wordpress') {
             push @p, "немає каталогу БД $CFG{sites_root}/$d/db" unless -d "$CFG{sites_root}/$d/db";
             push @p, 'немає secrets/' . "$d.env" unless -f secret_path($d);
@@ -1343,7 +1451,7 @@ sub cmd_doctor {
         # двох тижнів, автоматика вже мала спрацювати і не спрацювала.
         $soft->("$d: сертифікат спливає менш ніж за 14 днів (" . (cert_expiry($d) // '')
               . ') — автоматичне подовження не спрацювало, розберіться зараз')
-            if cert_live($d) && !cert_expires_within($d, 0) && cert_expires_within($d, 14 * 24 * 3600);
+            if $expiring;
 
         if (@p) { $bad->("$d: $_") for @p }
         else    { printf "  %s %-34s %s\n", c('1;32', '  ok  '), $d, cert_expiry($d) // '' }
