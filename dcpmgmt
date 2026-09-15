@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.5.0';
+our $VERSION = '1.5.1';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -269,14 +269,18 @@ sub write_file {
         return 'unchanged';
     }
     if (defined $old && !$o{force}) {
+        # Для файла, що належить адміну, «згенероване» — це порожній каркас
+        # із CHANGE-ME, а не пропозиція змін. Показувати таку різницю —
+        # лякати користувача тим, чого ніколи не станеться.
+        if ($o{owned_by_admin}) {
+            say_info "$rel — ваш файл, dcpmgmt його не чіпає (ні render, ні --force). "
+                   . 'Для цього домену інструмент відповідає лише за nginx-конфіг '
+                   . 'і за сертифікат (спільний сервіс certbot).';
+            return 'skipped';
+        }
         if ($o{diff}) {
-            say_info $o{owned_by_admin}
-                ? "$rel — відрізняється від каркаса, але це ВАШ файл: dcpmgmt його "
-                . 'не перезапише навіть із --force. Різниця нижче — довідково:'
-                : "$rel — відрізняється від згенерованого:";
+            say_info "$rel — відрізняється від згенерованого:";
             show_diff($path, $content);
-        } elsif ($o{owned_by_admin}) {
-            say_info "$rel — ваш файл, dcpmgmt його не чіпає (свіжий каркас: видаліть файл і повторіть render)";
         } else {
             say_warn "$rel — існує і відрізняється, залишено як є (--force перезапише, --diff покаже різницю)";
         }
@@ -762,8 +766,13 @@ sub ensure_site_dirs {
 sub warn_dropped_env {
     my ($e, $generated) = @_;
     my $current = slurp(domain_yml_path($e->{domain})) // return;
+    # Паролі не «зникають»: вони навмисно переїхали в secrets/*.env і
+    # підключаються через env_file. Радити повернути їх у yml означало б
+    # радити покласти пароль у файл, який може потрапити в git.
+    my %moved_to_secrets = map { $_ => 1 } qw(WORDPRESS_DB_PASSWORD MYSQL_PASSWORD);
     my %in_new = map { $_ => 1 } $generated =~ /^\s{6}([A-Z_][A-Z0-9_]*):/mg;
-    my @dropped = grep { !$in_new{$_} } $current =~ /^\s{6}([A-Z_][A-Z0-9_]*):/mg;
+    my @dropped = grep { !$in_new{$_} && !$moved_to_secrets{$_} }
+                  $current =~ /^\s{6}([A-Z_][A-Z0-9_]*):/mg;
     return unless @dropped;
     say_warn "docker-compose.domains/$e->{domain}.yml: у наявному файлі є змінні, "
            . 'яких немає в згенерованому: ' . join(', ', @dropped) . '.';
