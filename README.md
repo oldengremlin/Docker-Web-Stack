@@ -80,6 +80,7 @@ flowchart TD
     tool --> main["docker-compose.main.yml"]
     tool --> dom["docker-compose.domains/*.yml"]
     tool --> ngx["nginx/nginx-домен.conf"]
+    tool --> mainconf["nginx/nginx.conf<br/>лише при quic_bpf = on"]
 
     sec -.->|"env_file"| dom
     cust["nginx/custom/домен.conf<br/>ваші правки"] -.->|"include"| ngx
@@ -101,7 +102,8 @@ tools/backup.sh               бекап
    ├─→ docker-compose.yml            (генерується повністю)
    ├─→ docker-compose.main.yml       (генерується повністю)
    ├─→ docker-compose.domains/*.yml  (генерується; proxy-файли — ваші)
-   └─→ nginx/nginx-<домен>.conf      (генерується; ваші правки — в custom/)
+   ├─→ nginx/nginx-<домен>.conf      (генерується; ваші правки — в custom/)
+   └─→ nginx/nginx.conf              (лише якщо quic_bpf = on)
 
 /var/sites/<домен>/web        файли сайту
 /var/sites/<домен>/db         база даних
@@ -240,6 +242,47 @@ nginx віддає `301`, але в `web/` додатково кладеться
 без витрати лімітів — `dcpmgmt cert issue <домен> --staging`.
 
 ---
+
+## HTTP/3 і QUIC
+
+HTTP/3 вмикається по-доменно (`http3` у реєстрі, типово `on`). Дві речі
+на рівні всього стека:
+
+**`reuseport`** має стояти рівно в одному vhost — це вказується в
+`dcp.conf` (`quic_reuseport_domain`). Дублікат валить nginx із
+`duplicate listen options`, причому вказує на чужий файл. `doctor`
+стежить, щоб такий був один.
+
+**`quic_bpf`** — окрема історія. Це директива **головного** контексту:
+покласти її в `conf.d/` не можна, бо той інклюдиться всередині `http{}`.
+Тому при `quic_bpf = on` dcpmgmt генерує власний `nginx/nginx.conf` і
+монтує його як `/etc/nginx/nginx.conf`.
+
+Навіщо вона: з кількома воркерами і `reuseport` пакети QUIC-з'єднання
+після зміни IP клієнта (міграція з'єднання — Wi-Fi → LTE) можуть
+прилетіти не тому воркеру, що тримає стан з'єднання. eBPF-маршрутизація
+це виправляє.
+
+Ціна: nginx вантажить eBPF-програму зсередини контейнера, тож webserver
+отримує `CAP_BPF`, `CAP_NET_ADMIN` і `seccomp:unconfined` — типовий
+профіль seccomp у docker блокує виклик `bpf()` усім, крім `CAP_SYS_ADMIN`.
+Це той самий контейнер, що дивиться в інтернет.
+
+**Вмикати варто свідомо.** Якщо ядро чи docker не дадуть `bpf()`, nginx
+може не піднятись, а він один на всі домени. Порядок такий:
+
+```bash
+$EDITOR dcp.conf        # quic_bpf = on
+dcpmgmt apply
+docker logs webserver   # одразу, не відкладаючи
+```
+
+Відкат — `quic_bpf = off` і `dcpmgmt apply`.
+
+Дешевша альтернатива без жодних привілеїв: `worker_processes = 1`.
+Воркер один — маршрутизувати між воркерами нема чого, міграція QUIC
+працює сама. Для фронтенда, який віддає статику й проксіює на php-fpm,
+одного воркера вистачає надовго.
 
 ## Бекап
 

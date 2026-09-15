@@ -3,6 +3,31 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/uk/1.1.0/),
 версіонування — [семантичне](https://semver.org/lang/uk/).
 
+## [1.1.0] — 2026-09-15
+
+### Додано
+
+- Підтримка `quic_bpf` — eBPF-маршрутизації QUIC-пакетів між воркерами.
+  Це директива головного контексту, тому при `quic_bpf = on` у `dcp.conf`
+  генерується власний `nginx/nginx.conf` (шаблон
+  `templates/nginx.conf.tmpl`) і монтується як `/etc/nginx/nginx.conf`.
+  Разом із ним webserver отримує `CAP_BPF`, `CAP_NET_ADMIN` і
+  `seccomp:unconfined`: типовий профіль seccomp у docker блокує виклик
+  `bpf()` усім, крім `CAP_SYS_ADMIN`. Типове значення — `off`.
+- Налаштування `worker_processes` у `dcp.conf` — дешевша альтернатива
+  `quic_bpf` для коректної міграції QUIC-з'єднань.
+- Перевірки `doctor`: `quic_bpf = on` без згенерованого `nginx.conf`;
+  `quic_bpf` при одному воркері або без жодного `reuseport`;
+  розходження між `dcp.conf` і `quic_bpf` у наявному `nginx.conf`.
+
+### Змінено
+
+- Повідомлення `doctor` про файл виду `nginx/nginx-quic_bpf.conf` тепер
+  прямо каже, що такий файл ніколи не діяв, і як увімкнути директиву
+  по-справжньому.
+- `README.md`: розділ «HTTP/3 і QUIC»; `docs/troubleshooting.md`:
+  переписано розділ про `quic_bpf`.
+
 ## [1.0.0] — 2026-09-15
 
 Перший версійований випуск. Керування доменами переписано з набору

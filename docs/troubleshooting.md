@@ -61,11 +61,33 @@ QUIC — це UDP. Якщо в `ports` прокинуто тільки `443:443`
 
 *Закрито в dcpmgmt:* UDP-порт є в згенерованому `docker-compose.main.yml`.
 
-### `quic_bpf` не працює з conf.d
+### `quic_bpf` у conf.d не діє — і ніколи не діяв
 
-`quic_bpf on;` — директива **головного** контексту, в `/etc/nginx/conf.d/`
-вона не має сенсу. Покладіть її у `nginx/nginx.conf` — цей файл, якщо він
-існує, монтується як `/etc/nginx/nginx.conf`.
+`quic_bpf on;` — директива **головного** контексту. `/etc/nginx/conf.d/`
+інклюдиться всередині `http{}`, тож директива туди не лягає взагалі:
+в найкращому випадку файл нікуди не змонтований і просто лежить мертвим
+вантажем (саме так було з успадкованим `nginx/nginx-quic_bpf.conf`), у
+гіршому — nginx падає з `"quic_bpf" directive is not allowed here`.
+
+Вмикається через `dcp.conf`:
+
+```
+quic_bpf = on
+```
+
+dcpmgmt згенерує `nginx/nginx.conf`, змонтує його як
+`/etc/nginx/nginx.conf` і додасть webserver `CAP_BPF`, `CAP_NET_ADMIN`
+та `seccomp:unconfined` — без послаблення seccomp типовий профіль docker
+не дасть контейнеру викликати `bpf()`.
+
+Якщо після ввімкнення nginx не піднявся — дивіться `docker logs
+webserver`. Повертайте `quic_bpf = off` і `dcpmgmt apply`; альтернатива
+без привілеїв — `worker_processes = 1` (див. README, розділ «HTTP/3 і
+QUIC»).
+
+*Закрито в dcpmgmt:* `doctor` ловить розходження між `dcp.conf` і
+згенерованим `nginx.conf`, а також випадки, коли `quic_bpf` увімкнено
+там, де він нічого не дає (один воркер або жодного `reuseport`).
 
 ### `upstream sent too big header`
 

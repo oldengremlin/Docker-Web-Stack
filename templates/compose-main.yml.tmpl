@@ -26,6 +26,7 @@ services:
         while :; do sleep {{reload_interval}} & wait $${!}; nginx -s reload; done &
         exec nginx -g 'daemon off;'
 {{webserver_depends}}
+{{webserver_privileges}}
     volumes:
       - {{nginx_conf_dir}}:/etc/nginx/conf.d
       - ./nginx/custom:/etc/nginx/custom:ro
