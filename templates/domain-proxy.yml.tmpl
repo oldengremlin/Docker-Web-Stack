@@ -1,0 +1,17 @@
+# {{domain}} — проксі на незалежний застосунок. Каркас від dcpmgmt.
+#
+# Цей файл належить ВАМ: dcpmgmt створив його один раз і більше не чіпає
+# (перезаписати можна лише `dcpmgmt render --force {{domain}}`, що зітре
+# правки нижче). Сам dcpmgmt відповідає тут тільки за nginx-конфіг
+# nginx/nginx-{{domain}}.conf і за сертифікат.
+#
+# nginx проксіює на http://{{upstream}}/ — ім'я хоста в upstream має
+# збігатися з іменем сервісу або container_name нижче, і сервіс має бути
+# у мережі app-network, інакше nginx впаде з "host not found in upstream".
+services:
+  {{app_service}}:
+    image: CHANGE-ME:latest
+    container_name: {{app_service}}
+    restart: unless-stopped
+    networks:
+      - app-network

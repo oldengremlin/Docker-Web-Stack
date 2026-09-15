@@ -1,0 +1,11 @@
+# Згенеровано dcpmgmt — не редагувати вручну (буде перезаписано).
+# Джерело істини: domains/*.conf + dcp.conf. Перегенерувати: dcpmgmt render
+#
+# name: визначає префікс імен docker volume'ів (<name>_db-foocom). Змінити
+# його на працюючому сервері = compose створить нові порожні volume'и
+# замість наявних. Значення береться з dcp.conf (project).
+name: {{project}}
+
+include:
+  - docker-compose.main.yml
+{{includes}}

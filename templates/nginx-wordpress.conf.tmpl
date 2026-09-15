@@ -1,0 +1,86 @@
+# {{domain}} — WordPress (php-fpm: {{php_service}})
+# Згенеровано dcpmgmt. Правки, що мають пережити регенерацію, кладіть у
+# nginx/custom/{{domain}}.conf (рівень server) та
+# nginx/custom/{{domain}}.php.conf (усередині location ~ \.php$).
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{domain}};
+
+    location ~ /ads.txt {
+        allow all;
+        root {{webroot}};
+    }
+
+    location ~ /.well-known/acme-challenge {
+        allow all;
+        root {{webroot}};
+        try_files $uri =404;
+    }
+
+    location / {
+        return 302 https://{{domain}}$request_uri;
+    }
+}
+
+server {
+{{listen443}}
+
+    server_name {{domain}};
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/x-javascript text/xml application/xml application/rss+xml text/javascript image/x-icon image/bmp image/svg+xml;
+    gzip_vary on;
+    gzip_comp_level 1;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+{{alt_svc}}
+    ssl_certificate /etc/letsencrypt/live/{{domain}}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{domain}}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/{{domain}}/chain.pem;
+
+    server_tokens off;
+
+    root {{webroot}};
+    index index.php index.html index.htm;
+
+    include /etc/nginx/custom/{{domain}}.conf;
+
+    location / {
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass {{php_service}}:9000;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $fastcgi_path_info;
+
+        # Великі заголовки (CSP/cookie-плагіни) не влазять у дефолтні буфери:
+        # "upstream sent too big header while reading response header".
+        fastcgi_buffer_size 64k;
+        fastcgi_buffers 16 32k;
+
+        include /etc/nginx/custom/{{domain}}.php.conf;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+
+    location = /favicon.ico {
+        log_not_found off; access_log off;
+    }
+
+    location = /robots.txt {
+        log_not_found off; access_log off; allow all;
+    }
+
+    location ~* \.(css|gif|ico|jpeg|jpg|js|png)$ {
+        expires max;
+        log_not_found off;
+    }
+}

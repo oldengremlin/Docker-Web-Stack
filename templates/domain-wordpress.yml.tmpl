@@ -1,0 +1,67 @@
+# {{domain}} — WordPress + MariaDB. Згенеровано dcpmgmt.
+# Паролі живуть у secrets/{{domain}}.env (поза git) і підключаються через
+# env_file; у цьому файлі їх немає.
+services:
+  wordpress-{{sid}}:
+    image: {{wp_image}}
+    container_name: wordpress-{{sid}}
+    restart: unless-stopped
+    # Офіційний entrypoint розгортає ядро WordPress і створює wp-config.php
+    # у своєму WORKDIR. Без working_dir це /var/www/html цілого контейнера
+    # (ефемерно, ані nginx, ані хост його не бачать), а /var/www/html/{{domain}}
+    # лишається порожнім — класична пастка цієї схеми.
+    working_dir: /var/www/html/{{domain}}
+    env_file:
+      - ../secrets/{{domain}}.env
+    environment:
+      WORDPRESS_DB_HOST: db-{{sid}}
+      WORDPRESS_DB_USER: {{db_user}}
+      WORDPRESS_DB_NAME: {{db_name}}
+    volumes:
+      - wordpress-{{sid}}:/var/www/html/{{domain}}
+    depends_on:
+      db-{{sid}}:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  db-{{sid}}:
+    image: {{db_image}}
+    container_name: db-{{sid}}
+    restart: unless-stopped
+    command:
+      - '--skip-log-bin'
+    env_file:
+      - ../secrets/{{domain}}.env
+    environment:
+      MYSQL_DATABASE: {{db_name}}
+      MYSQL_USER: {{db_user}}
+      MYSQL_RANDOM_ROOT_PASSWORD: '1'
+    cap_add:
+      - CAP_SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - db-{{sid}}:/var/lib/mysql
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -hlocalhost -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 20s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  wordpress-{{sid}}:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: {{sites_root}}/{{domain}}/web
+  db-{{sid}}:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: {{sites_root}}/{{domain}}/db

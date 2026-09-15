@@ -1,0 +1,72 @@
+# Згенеровано dcpmgmt — не редагувати вручну (буде перезаписано).
+# Джерело істини: domains/*.conf + dcp.conf. Перегенерувати: dcpmgmt render
+#
+# Тут живуть два спільні сервіси на весь стек:
+#   webserver — єдиний nginx-фронтенд (http/2, http/3, TLS) для всіх доменів;
+#   certbot   — один цикл `certbot renew` на всі сертифікати.
+#
+# webserver раз на {{reload_interval}} робить `nginx -s reload`: certbot
+# оновлює сертифікат на диску, але nginx тримає старий у пам'яті до
+# перезавантаження конфігурації — без цього циклу подовжений сертифікат
+# не потрапляє до клієнтів.
+
+services:
+  webserver:
+    image: {{nginx_image}}
+    container_name: webserver
+    restart: unless-stopped
+    ports:
+      - 80:80
+      - 443:443
+      - 443:443/udp
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while :; do sleep {{reload_interval}} & wait $${!}; nginx -s reload; done &
+        exec nginx -g 'daemon off;'
+{{webserver_depends}}
+    volumes:
+      - {{nginx_conf_dir}}:/etc/nginx/conf.d
+      - ./nginx/custom:/etc/nginx/custom:ro
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+{{webserver_volumes}}
+    environment:
+      - TZ={{tz}}
+    networks:
+      - app-network
+
+  certbot:
+    image: {{certbot_image}}
+    container_name: certbot
+    restart: unless-stopped
+    depends_on:
+      - webserver
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+{{certbot_volumes}}
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep {{renew_interval}} & wait $${!}; done;'"
+    networks:
+      - app-network
+
+volumes:
+  certbot-etc:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: {{letsencrypt_dir}}/etc
+  certbot-var:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: {{letsencrypt_dir}}/var
+
+networks:
+  app-network:
+    driver: bridge

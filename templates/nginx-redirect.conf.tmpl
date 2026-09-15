@@ -1,0 +1,52 @@
+# {{domain}} -> https://{{target}} (301)
+# Згенеровано dcpmgmt. Правки, що мають пережити регенерацію, — у
+# nginx/custom/{{domain}}.conf.
+#
+# index.html у {{webroot}} дублює редірект через <meta refresh> — це
+# підстраховка на випадок, коли 443-блок нижче тимчасово вимкнено.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{domain}};
+
+    location ~ /ads.txt {
+        allow all;
+        root {{webroot}};
+    }
+
+    location ~ /.well-known/acme-challenge {
+        allow all;
+        root {{webroot}};
+        try_files $uri =404;
+    }
+
+    location / {
+        return 302 https://{{domain}}$request_uri;
+    }
+}
+
+server {
+{{listen443}}
+
+    server_name {{domain}};
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+{{alt_svc}}
+    ssl_certificate /etc/letsencrypt/live/{{domain}}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{domain}}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/{{domain}}/chain.pem;
+
+    server_tokens off;
+
+    root {{webroot}};
+    index index.html index.htm;
+
+    include /etc/nginx/custom/{{domain}}.conf;
+
+    location ~ /ads.txt {
+        allow all;
+        root {{webroot}};
+    }
+
+    return 301 https://{{target}}$request_uri;
+}
