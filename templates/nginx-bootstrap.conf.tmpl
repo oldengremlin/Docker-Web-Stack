@@ -1,0 +1,20 @@
+# {{domain}} — тимчасовий конфіг на час первинної видачі сертифіката.
+# Без 443-блоку: ssl_certificate на неіснуючий файл валить ВЕСЬ nginx
+# (один процес на всі домени), а не тільки цей сайт.
+# dcpmgmt замінює цей файл на бойовий одразу після видачі сертифіката.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{domain}};
+
+    location ~ /.well-known/acme-challenge {
+        allow all;
+        root {{webroot}};
+        try_files $uri =404;
+    }
+
+    location / {
+        add_header Content-Type text/plain;
+        return 200 'provisioning';
+    }
+}

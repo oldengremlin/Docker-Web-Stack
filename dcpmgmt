@@ -1,741 +1,1490 @@
-#!/usr/bin/env bash
+#!/usr/bin/perl
 #
-# dcpmgmt — керування доменами в мультидоменному docker-compose проєкті
-# (nginx + per-домен WordPress/redirect/proxy контейнери).
+# dcpmgmt — керування доменами мультидоменного docker-стека
+#           (один nginx-фронтенд + per-домен WordPress / redirect / proxy).
 #
-# Запускати з кореня проєкту (~/src/docker-compose-project), під користувачем
-# з правами sudo/docker.
+# Джерело істини — реєстр domains/*.conf і dcp.conf. Усе інше
+# (docker-compose.yml, docker-compose.main.yml, nginx/*.conf,
+# docker-compose.domains/*.yml) генерується з нього за шаблонами
+# з templates/. Ручні правки в згенерованому не зникають мовчки:
+# `render` без --force не перезаписує наявні файли, а `render --diff`
+# показує розбіжність.
 #
-# Команди:
-#   dcpmgmt add-site <domain> [image]
-#   dcpmgmt del-site <domain>
-#   dcpmgmt add-redirect-site <alias> <target-domain>
-#   dcpmgmt del-redirect-site <alias>
-#   dcpmgmt add-proxy-site <domain> <upstream-host:port>
-#   dcpmgmt del-proxy-site <domain>
+# Документація: README.md
 #
-# ПЕРЕД ПЕРШИМ ВИКОРИСТАННЯМ:
-#   - перевірте змінні в розділі "Налаштування" нижче (шляхи, email для certbot);
-#   - зробіть git commit / бекап поточного стану проєкту;
-#   - протестуйте на не-критичному домені перед тим, як довіряти скрипту прод.
+# SPDX-License-Identifier: GPL-2.0-only
+
+use strict;
+use warnings;
+use utf8;                       # у вихідному коді є кирилиця
+use File::Basename qw(basename dirname);
+use File::Path qw(make_path remove_tree);
+use File::Temp qw(tempdir);
+use Cwd qw(abs_path);
+use Getopt::Long qw(GetOptionsFromArray);
+use Digest::SHA qw(hmac_sha512);
+use MIME::Base64 qw(encode_base64);
+
+our $VERSION = '1.2.0';
+
+my $ROOT = dirname(abs_path($0));
+
+binmode STDOUT, ':encoding(UTF-8)';
+binmode STDERR, ':encoding(UTF-8)';
+
+$| = 1;   # без буферизації: інакше stdout і stderr плутаються місцями
+
+# ─────────────────────────── вивід ───────────────────────────
+
+my $NOCOLOR = (!-t STDOUT) || $ENV{NO_COLOR};
+sub c { my ($code, $s) = @_; return $NOCOLOR ? $s : "\e[${code}m${s}\e[0m"; }
+sub say_ok   { print c('1;32', '  ok  '), " @_\n"; }
+sub say_info { print c('1;34', ' info '), " @_\n"; }
+sub say_warn { print c('1;33', ' увага'), " @_\n"; }
+sub say_step { print "\n", c('1;37', "== @_"), "\n"; }
+sub die_err  { print STDERR c('1;31', ' збій '), " @_\n"; exit 1; }
+sub say_err  { print c('1;31', 'помилка'), " @_\n"; }
+
+my $YES = 0;
+sub confirm {
+    my ($q) = @_;
+    return 1 if $YES;
+    print c('1;33', ' ? '), " $q [так/ні]: ";
+    my $a = <STDIN>;
+    return 0 unless defined $a;
+    chomp $a;
+    return $a =~ /^(так|yes|y)$/i;
+}
+
+# ─────────────────────────── конфіг ───────────────────────────
+
+my %CFG = (
+    project         => 'docker-compose-project',
+    sites_root      => '/var/sites',
+    nginx_conf_dir  => '/var/sites/nginx-conf',
+    letsencrypt_dir => '/var/sites/letsencrypt',
+    certbot_email   => '',
+    wordpress_image => 'wordpress:6.8.3-php8.4-fpm',
+    db_image        => 'mariadb:latest',
+    nginx_image     => 'nginx:latest',
+    certbot_image   => 'certbot/certbot',
+    tz              => 'Europe/Kiev',
+    quic_reuseport_domain => '',
+    worker_processes => 'auto',
+    password_mode   => 'derived',
+    master_key_file => '~/.dcp-master-key',
+    quic_bpf        => 'off',
+    reload_interval => '6h',
+    renew_interval  => '12h',
+);
+
+sub read_kv {
+    my ($path) = @_;
+    my %h;
+    open my $fh, '<:encoding(UTF-8)', $path or return;
+    while (my $l = <$fh>) {
+        chomp $l;
+        $l =~ s/^\s+|\s+$//g;
+        next if $l eq '' || $l =~ /^#/;
+        my ($k, $v) = $l =~ /^([A-Za-z0-9_]+)\s*=\s*(.*)$/ or next;
+        $v =~ s/\s+$//;
+        $h{lc $k} = $v;
+    }
+    close $fh;
+    return %h;
+}
+
+sub load_config {
+    my $path = "$ROOT/dcp.conf";
+    unless (-f $path) {
+        die_err "немає $path. Скопіюйте dcp.conf.example -> dcp.conf і виправте,\n"
+              . "       або запустіть: dcpmgmt init";
+    }
+    my %h = read_kv($path);
+    $CFG{$_} = $h{$_} for grep { exists $CFG{$_} } keys %h;
+    for my $unknown (grep { !exists $CFG{$_} } keys %h) {
+        say_warn "dcp.conf: невідомий ключ '$unknown' — проігноровано";
+    }
+    die_err "dcp.conf: не заповнено certbot_email" unless $CFG{certbot_email};
+}
+
+# ─────────────────────── імена, похідні від домену ───────────────────────
 #
-# Скрипт НЕ ідеальний і не претендує на промислову якість "з коробки" —
-# це робоча перша версія, призначена для подальшого ітеративного гартування
-# (рекомендовано — Claude Code, з git-репозиторієм і реальним тестуванням).
+# Усі ідентифікатори БД виводяться з імені домену детерміновано —
+# нічого не питаємо в користувача і нічого не вигадуємо двічі.
+#   www.ukr-com.net -> sid  wwwukr-comnet   (крапки геть, дефіси лишаються)
+#                      db   wwwukr-comnet
+#                      user uwwwukr-comnet
+#                      host db-wwwukr-comnet
+# Саме так названі наявні продакшн-контейнери — сумісність навмисна.
 
-set -euo pipefail
-
-# ───────────────────────── Налаштування ─────────────────────────
-
-PROJECT_DIR="$(pwd)"
-SITES_ROOT="/var/sites"
-NGINX_CONF_DIR="${PROJECT_DIR}/nginx"
-DOMAINS_YML_DIR="${PROJECT_DIR}/docker-compose.domains"
-COMPOSE_MAIN="${PROJECT_DIR}/docker-compose.main.yml"
-COMPOSE_ROOT="${PROJECT_DIR}/docker-compose.yml"
-CERTBOT_EMAIL="oldengremlin@gmail.com"
-DEFAULT_WP_IMAGE="wordpress:6.8.3-php8.4-fpm"
-DEFAULT_DB_IMAGE="mariadb:latest"
-
-# ───────────────────────── Допоміжні функції ─────────────────────────
-
-log()  { echo -e "\033[1;34m[dcpmgmt]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[dcpmgmt WARN]\033[0m $*" >&2; }
-die()  { echo -e "\033[1;31m[dcpmgmt ERROR]\033[0m $*" >&2; exit 1; }
-
-require_root_dir() {
-    [[ -f "$COMPOSE_ROOT" && -f "$COMPOSE_MAIN" ]] \
-        || die "Не знайдено docker-compose.yml/docker-compose.main.yml у $(pwd). Запускайте з кореня проєкту."
+sub sid_of {
+    my ($domain) = @_;
+    my $s = lc $domain;
+    $s =~ s/\.//g;
+    return $s;
 }
 
-# service_id: домен без крапок/дефісів, у нижньому регістрі — так само,
-# як у всьому проєкті (vvv.soft-dental.kiev.ua -> vvvsoft-dentalkievua)
-service_id() {
-    echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '.-'
+# Суфікс для обрізаних імен: потрібен лише для унікальності, не для
+# криптографії. Digest::MD5 є в core perl, але якщо збірка без нього —
+# контрольної суми рядка вистачить для тієї ж мети.
+sub md5_hex_of {
+    my ($value) = @_;
+    eval { require Digest::MD5; 1 }
+        or return substr(sprintf('%08x', unpack('%32C*', $value)), 0, 8);
+    return substr(Digest::MD5::md5_hex($value), 0, 8);
 }
 
-# db-юзер: 'u' + service_id, обрізаний до 32 символів (ліміт MySQL/MariaDB)
-db_user_for() {
-    local sid
-    sid="$(service_id "$1")"
-    local u="u${sid}"
-    if [[ ${#u} -gt 32 ]]; then
-        u="${u:0:24}$(echo -n "$1" | md5sum | cut -c1-8)"
-    fi
-    echo "$u"
+# Ліміт імені бази — 64 символи, імені користувача — 32 (MySQL; MariaDB
+# щедріша, але тримаємось меншого). Довші домени обрізаємо й доліплюємо
+# суфікс, щоб два схожі домени не отримали однакове ім'я.
+sub db_name_of {
+    my ($domain) = @_;
+    my $name = sid_of($domain);
+    return length($name) <= 64 ? $name : substr($name, 0, 55) . '_' . md5_hex_of($domain);
 }
 
-random_password() {
-    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40
+sub db_user_of {
+    my ($domain) = @_;
+    my $user = 'u' . sid_of($domain);
+    return length($user) <= 32 ? $user : substr($user, 0, 23) . '_' . md5_hex_of($domain);
 }
 
-confirm() {
-    local prompt="$1"
-    read -r -p "$prompt [так/ні]: " ans
-    [[ "$ans" == "так" || "$ans" == "yes" || "$ans" == "y" ]]
-}
+sub random_password {
+    my $length   = 48;
+    my @alphabet = ('A'..'Z', 'a'..'z', 0..9);   # 62 символи
 
-nginx_test_and_reload() {
-    log "nginx -t ..."
-    docker exec webserver nginx -t
-    log "nginx -s reload ..."
-    docker exec webserver nginx -s reload
-}
+    # Байти, що не діляться націло на розмір алфавіту, відкидаємо, а не
+    # беремо за модулем: 256 % 62 = 8, тож перші вісім символів алфавіту
+    # інакше випадали б частіше за решту.
+    my $limit = int(256 / @alphabet) * @alphabet;
 
-ensure_webroot_dir() {
-    local domain="$1"
-    mkdir -p "${SITES_ROOT}/${domain}/web"
-}
-
-# Додає домен в top-level include: docker-compose.yml (якщо ще не додано)
-compose_include_add() {
-    local domain="$1"
-    local line="  - docker-compose.domains/${domain}.yml"
-    grep -qxF "$line" "$COMPOSE_ROOT" && { log "include вже містить ${domain}.yml"; return; }
-    # вставляємо одразу після рядка "include:"
-    sed -i "/^include:$/a ${line}" "$COMPOSE_ROOT"
-    log "Додано в docker-compose.yml: ${line}"
-}
-
-compose_include_remove() {
-    local domain="$1"
-    local line="  - docker-compose.domains/${domain}.yml"
-    sed -i "\#^${line}\$#d" "$COMPOSE_ROOT"
-    log "Прибрано з docker-compose.yml: ${line}"
-}
-
-# Додає сервіс у depends_on: та volume+конфіг у volumes: секцію webserver
-# у docker-compose.main.yml. Працює текстовими вставками "перед першим
-# рядком, що починається з певного маркера" — крихко до ручних правок
-# структури файлу, але передбачувано для типового випадку.
-webserver_deps_volumes_add() {
-    local domain="$1" service="$2" is_wp_or_redirect="$3"  # "1" якщо потрібен volume /var/www/html/<domain>, інакше "0"
-
-    # depends_on: вставити перед рядком "    volumes:"
-    if ! grep -q "^      - ${service}\$" "$COMPOSE_MAIN"; then
-        sed -i "0,/^    volumes:\$/s//      - ${service}\n    volumes:/" "$COMPOSE_MAIN"
-        log "webserver depends_on += ${service}"
-    fi
-
-    if [[ "$is_wp_or_redirect" == "1" ]]; then
-        # volumes: вставити перед рядком "    environment:"
-        local vol_lines="      - ${service}:/var/www/html/${domain}\n      - ./nginx/nginx-${domain}.conf:/etc/nginx/conf.d/${domain}.conf:ro"
-        if ! grep -q "^      - ${service}:/var/www/html/${domain}\$" "$COMPOSE_MAIN"; then
-            sed -i "0,/^    environment:\$/s#^    environment:\$#${vol_lines}\n    environment:#" "$COMPOSE_MAIN"
-            log "webserver volumes += ${service} webroot + nginx conf"
-        fi
-    else
-        # проксі-сайт: тільки конфіг nginx, без /var/www/html volume
-        local vol_line="      - ./nginx/nginx-${domain}.conf:/etc/nginx/conf.d/${domain}.conf:ro"
-        if ! grep -qxF "$vol_line" "$COMPOSE_MAIN"; then
-            sed -i "0,/^    environment:\$/s#^    environment:\$#${vol_line}\n    environment:#" "$COMPOSE_MAIN"
-            log "webserver volumes += nginx conf (proxy-сайт)"
-        fi
-    fi
-}
-
-webserver_deps_volumes_remove() {
-    local domain="$1" service="$2"
-    sed -i "\#^      - ${service}\$#d" "$COMPOSE_MAIN"
-    sed -i "\#^      - ${service}:/var/www/html/${domain}\$#d" "$COMPOSE_MAIN"
-    sed -i "\#^      - \./nginx/nginx-${domain}\.conf:/etc/nginx/conf.d/${domain}\.conf:ro\$#d" "$COMPOSE_MAIN"
-    log "webserver depends_on/volumes: прибрано записи для ${domain}"
-}
-
-# ───────────────────────── Шаблони nginx ─────────────────────────
-
-# :80-заглушка на час первинного отримання сертифіката (без :443-блоку,
-# бо ssl_certificate ще фізично не існує — інакше nginx -t впаде)
-write_nginx_bootstrap_conf() {
-    local domain="$1"
-    cat > "${NGINX_CONF_DIR}/nginx-${domain}.conf" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-    location ~ /.well-known/acme-challenge {
-        allow all;
-        root /var/www/html/${domain};
+    open my $fh, '<:raw', '/dev/urandom' or die_err 'немає /dev/urandom';
+    my $password = '';
+    while (length($password) < $length) {
+        read $fh, my $buf, $length or die_err 'не читається /dev/urandom';
+        $password .= $alphabet[$_ % @alphabet] for grep { $_ < $limit } unpack 'C*', $buf;
     }
-    location / {
-        return 200 'provisioning';
-        add_header Content-Type text/plain;
-    }
-}
-EOF
+    close $fh;
+    return substr($password, 0, $length);
 }
 
-write_nginx_wp_conf() {
-    local domain="$1" service="$2"
-    cat > "${NGINX_CONF_DIR}/nginx-${domain}.conf" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-    location ~ /ads.txt {
-        allow all;
-        root /var/www/html/${domain};
-    }
-    location ~ /.well-known/acme-challenge {
-        allow all;
-        root /var/www/html/${domain};
-    }
-    location / {
-        return 302 https://${domain}\$request_uri;
-    }
+# Тільки нижній регістр і мінімум одна крапка. Кирилиця не приймається
+# свідомо: ім'я домену стає іменем каталогу, контейнера й бази, тож
+# інтернаціоналізовані домени подаються в punycode (xn--...), як вони й
+# записані в наявному стеку.
+sub valid_domain {
+    my ($domain) = @_;
+    return 0 if length($domain) > 253;
+    return $domain =~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
 }
-server {
-    listen 443 quic;
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
-    http3 on;
-    quic_gso on;
-    quic_retry on;
 
-    gzip on;
-    gzip_types text/plain text/css application/javascript application/x-javascript text/xml application/xml application/rss+xml text/javascript image/x-icon image/bmp image/svg+xml;
-    gzip_vary on;
-    gzip_comp_level 1;
+# ─────────────────────────── реєстр ───────────────────────────
 
-    ssl_protocols TLSv1.2 TLSv1.3;
-    add_header Alt-Svc 'h3=":443"; h3-29=":443"; ma=86400';
+sub reg_dir  { "$ROOT/domains" }
+sub reg_path { my ($d) = @_; reg_dir() . "/$d.conf" }
 
-    server_name ${domain};
+sub reg_load_one {
+    my ($d) = @_;
+    my %h = read_kv(reg_path($d));
+    return undef unless %h;
+    $h{domain} = $d;
+    $h{type}     //= 'redirect';
+    $h{http3}    //= 'on';
+    $h{enabled}  //= 'yes';
+    return \%h;
+}
 
-    index index.php index.html index.htm;
+sub reg_all {
+    my @out;
+    for my $f (sort glob(reg_dir() . '/*.conf')) {
+        my $d = basename($f, '.conf');
+        my $e = reg_load_one($d) or next;
+        push @out, $e;
+    }
+    return @out;
+}
 
-    root /var/www/html/${domain};
+sub reg_enabled { grep { $_->{enabled} eq 'yes' } reg_all() }
 
-    server_tokens off;
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${domain}/chain.pem;
+sub reg_save {
+    my ($e) = @_;
+    my $d = $e->{domain};
+    make_path(reg_dir()) unless -d reg_dir();
+    my @order = qw(type domain target upstream app_service image db_image
+                   db_name db_user php_service password_mode http3 enabled note);
+    my $out = "# Реєстр домену $d. Джерело істини для dcpmgmt render.\n"
+            . "# Змінили щось руками — виконайте: dcpmgmt render --diff\n";
+    for my $k (@order) {
+        next unless defined $e->{$k} && $e->{$k} ne '';
+        $out .= sprintf("%-11s = %s\n", $k, $e->{$k});
+    }
+    write_file(reg_path($d), $out, force => 1, quiet => 1);
+    return 1;
+}
 
-    location / {
-            try_files \$uri \$uri/ /index.php\$is_args\$args;
+# ─────────────────────────── файли ───────────────────────────
+
+# Вміст nginx-конфіга без коментарів. Закоментований `# listen 443 quic
+# reuseport;` — це не конфігурація, і шукати в ньому directives не можна.
+sub nginx_uncommented {
+    my ($path) = @_;
+    my $c = slurp($path) // return undef;
+    $c =~ s/(^|\s)#[^\n]*//g;
+    return $c;
+}
+
+sub slurp {
+    my ($p) = @_;
+    open my $fh, '<:encoding(UTF-8)', $p or return undef;
+    local $/;
+    my $c = <$fh>;
+    close $fh;
+    return $c;
+}
+
+# write_file($path, $content, force => 0|1, diff => 0|1, mode => 0644, quiet => 0|1)
+#   Наявний файл із іншим вмістом без force НЕ перезаписується — це головна
+#   гарантія проти «скрипт затер мої ручні правки на проді».
+sub write_file {
+    my ($path, $content, %o) = @_;
+    my $rel = $path;
+    $rel =~ s/^\Q$ROOT\E\///;
+    my $old = slurp($path);
+
+    if (defined $old && $old eq $content) {
+        say_ok "$rel — без змін" unless $o{quiet};
+        return 'unchanged';
+    }
+    if (defined $old && !$o{force}) {
+        if ($o{diff}) {
+            say_info "$rel — відрізняється від згенерованого:";
+            show_diff($path, $content);
+        } elsif ($o{owned_by_admin}) {
+            say_info "$rel — ваш файл, dcpmgmt його не чіпає (свіжий каркас: видаліть файл і повторіть render)";
+        } else {
+            say_warn "$rel — існує і відрізняється, залишено як є (--force перезапише, --diff покаже різницю)";
+        }
+        return 'skipped';
     }
 
-    location ~ \.php\$ {
-            try_files \$uri =404;
-            fastcgi_split_path_info ^(.+\.php)(/.+)\$;
-            fastcgi_pass ${service}:9000;
-            fastcgi_index index.php;
-            include fastcgi_params;
-            fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-            fastcgi_param PATH_INFO \$fastcgi_path_info;
+    make_path(dirname($path)) unless -d dirname($path);
+    if (defined $old) {
+        my $bak = "$path.bak";
+        if (open my $bh, '>:encoding(UTF-8)', $bak) { print $bh $old; close $bh; chmod 0600, $bak; }
+    }
+    open my $fh, '>:encoding(UTF-8)', $path or die_err "не можу писати $path: $!";
+    # Права виставляються до запису вмісту: інакше файл із паролем устигає
+    # полежати з дефолтними 0644 рівно стільки, скільки триває print.
+    chmod($o{mode}, $path) if $o{mode};
+    print $fh $content;
+    close $fh;
+    say_ok(defined $old ? "$rel — оновлено" : "$rel — створено") unless $o{quiet};
+    return defined $old ? 'updated' : 'created';
+}
 
-            fastcgi_buffer_size 64k;
-            fastcgi_buffers 16 32k;
+sub show_diff {
+    my ($path, $new) = @_;
+    my $dir = tempdir(CLEANUP => 1);
+    open my $fh, '>:encoding(UTF-8)', "$dir/new" or return;
+    print $fh $new;
+    close $fh;
+    system('diff', '-u', '--label', $path, '--label', "$path (згенероване)", $path, "$dir/new");
+}
+
+# ─────────────────────────── шаблони ───────────────────────────
+
+sub render_template {
+    my ($name, %vars) = @_;
+    my $path = "$ROOT/templates/$name";
+    my $template = slurp($path) or die_err "немає шаблону $path";
+    my %missing;
+    $template =~ s/\{\{(\w+)\}\}/
+        defined $vars{$1} ? $vars{$1} : do { $missing{$1} = 1; "{{$1}}" }
+    /ge;
+    # Незаповнений плейсхолдер лишається в тексті й дійде до nginx або
+    # compose як сміття. Не вбиваємо генерацію, але кажемо вголос, бо
+    # інакше причину шукатимуть у повідомленні nginx, а не в шаблоні.
+    say_warn "шаблон $name: не заповнено " . join(', ', map { "{{$_}}" } sort keys %missing)
+        if %missing;
+    return $template;
+}
+
+# ─────────────────────────── docker ───────────────────────────
+
+sub run {
+    my (@cmd) = @_;
+    say_info c('0;36', join ' ', @cmd);
+    my $rc = system(@cmd);
+    return $rc == 0;
+}
+
+sub run_or_die {
+    my (@cmd) = @_;
+    run(@cmd) or die_err "команда завершилась помилкою: @cmd";
+}
+
+# Вивід команди без запуску шелла (аргументи можуть містити що завгодно).
+# stderr глушиться навмисно: docker пише туди попередження, які інакше
+# потраплять у розбір як дані.
+sub capture {
+    my (@cmd) = @_;
+    my $pid = open(my $fh, '-|');
+    die_err "fork: $!" unless defined $pid;
+    if (!$pid) { open STDERR, '>', '/dev/null'; exec @cmd; exit 127; }
+    local $/;
+    my $out = <$fh>;
+    close $fh;
+    return defined $out ? $out : '';
+}
+
+sub have_docker { return system('docker version >/dev/null 2>&1') == 0 }
+
+sub compose { my (@a) = @_; chdir $ROOT; return run('docker', 'compose', @a) }
+
+sub container_running {
+    my ($name) = @_;
+    my $out = capture('docker', 'ps', '--format', '{{.Names}}');
+    return grep { $_ eq $name } split /\n/, $out;
+}
+
+sub nginx_test_reload {
+    unless (container_running('webserver')) {
+        say_warn 'контейнер webserver не запущено — nginx -t пропущено';
+        return 0;
+    }
+    unless (run('docker', 'exec', 'webserver', 'nginx', '-t')) {
+        die_err "nginx -t не пройшов. Конфігурацію НЕ перезавантажено, працюючий nginx\n"
+              . "       далі крутиться зі старою конфігурацією в пам'яті — сайти живі.\n"
+              . "       Полагодьте конфіг і повторіть: dcpmgmt apply";
+    }
+    run_or_die('docker', 'exec', 'webserver', 'nginx', '-s', 'reload');
+    say_ok 'nginx перезавантажено';
+    return 1;
+}
+
+sub cert_dir  { my ($d) = @_; "$CFG{letsencrypt_dir}/etc/live/$d" }
+sub cert_live { my ($d) = @_; -e cert_dir($d) . '/fullchain.pem' }
+
+# ─────────────────────────── секрети ───────────────────────────
+
+sub secret_path { my ($d) = @_; "$ROOT/secrets/$d.env" }
+
+# '~' розкривається в домівку ефективного користувача з /etc/passwd, а не
+# з $HOME: під sudo змінна оточення показує на кого завгодно, залежно від
+# налаштувань sudoers, і ключ загубиться в чужій домівці.
+sub master_key_path {
+    my $path = $CFG{master_key_file};
+    $path =~ s{^~(?=/|$)}{ (getpwuid($>))[7] // '/root' }e;
+    return $path;
+}
+
+# Ключ створюється один раз і більше не змінюється: зміна зробить усі
+# виведені паролі невідтворюваними, а в БД вони лишаться старими.
+sub master_key {
+    my $path = master_key_path();
+    unless (-f $path) {
+        open my $urandom, '<:raw', '/dev/urandom' or die_err 'немає /dev/urandom';
+        read $urandom, my $bytes, 48;
+        close $urandom;
+        my $key = encode_base64($bytes, '');
+
+        make_path(dirname($path)) unless -d dirname($path);
+        open my $fh, '>', $path or die_err "не можу створити $path: $!";
+        chmod 0400, $path;
+        print $fh "$key\n";
+        close $fh;
+
+        say_warn "створено майстер-ключ $path (0400).";
+        say_warn 'Це єдине, з чого відновлюються паролі БД усіх майбутніх доменів.';
+        say_warn 'Покладіть копію в менеджер паролів — і НЕ змінюйте цей файл:';
+        say_warn 'зміна зробить уже видані паролі невідтворюваними.';
+    }
+    open my $fh, '<', $path or die_err "не можу прочитати $path: $!";
+    my $key = <$fh>;
+    close $fh;
+    chomp $key;
+    die_err "майстер-ключ $path порожній" unless length $key;
+    return $key;
+}
+
+# HMAC-SHA512(ключ, домен) у base64. '+', '/' і '=' прибираються, щоб
+# пароль лишався тим самим рядком скрізь — у env_file, у healthcheck
+# всередині подвійних лапок, у консолі mariadb.
+#
+# Той самий алгоритм, що й у tools/mkpass — результати мають збігатися.
+sub derived_password {
+    my ($domain) = @_;
+    my $b64 = encode_base64(hmac_sha512($domain, master_key()), '');
+    $b64 =~ tr{+/=}{}d;
+    return substr($b64, 0, 48);
+}
+
+# Непорожній каталог даних = mariadb уже пройшла ініціалізацію і пароль
+# із оточення більше не читає.
+sub db_initialized {
+    my ($domain) = @_;
+    my $dir = "$CFG{sites_root}/$domain/db";
+    return 0 unless -d $dir;
+    opendir my $dh, $dir or return 0;
+    my @entries = grep { !/^\.\.?$/ } readdir $dh;
+    closedir $dh;
+    return scalar @entries;
+}
+
+sub secret_ensure {
+    my ($e) = @_;
+    my $d    = $e->{domain};
+    my $path = secret_path($d);
+    return 0 if -f $path;
+
+    my $mode = $e->{password_mode} // $CFG{password_mode};
+
+    # База вже ініціалізована, а файла з паролем немає. Для derived це не
+    # біда — виведемо той самий. Для random вигаданий новий пароль БД не
+    # прийме: MariaDB бере MYSQL_PASSWORD лише при першому старті на
+    # порожньому каталозі. Мовчки створити файл означало б підсунути
+    # робочому сайту помилку автентифікації під виглядом полагодженого.
+    if ($mode ne 'derived' && db_initialized($d)) {
+        say_err "secrets/$d.env немає, а база в $CFG{sites_root}/$d/db вже існує "
+              . 'і знає СТАРИЙ випадковий пароль.';
+        say_err 'Новий тут не допоможе — його БД не прийме. Або відновіть файл із '
+              . 'бекапу, або змініть пароль у самій БД:';
+        say_err "  docker exec -it db-" . sid_of($d) . " mariadb -uroot -p"
+              . '  →  ALTER USER ... IDENTIFIED BY ...';
+        return 0;
     }
 
-    location ~ /\.ht {
-            deny all;
+    my $pass = $mode eq 'derived' ? derived_password($d) : random_password();
+
+    make_path("$ROOT/secrets") unless -d "$ROOT/secrets";
+    chmod 0700, "$ROOT/secrets";
+    write_file($path, secret_body($d, $pass, $mode), force => 1, mode => 0600, quiet => 1);
+    say_ok "secrets/$d.env — створено (пароль: $mode, 48 символів)";
+    return 1;
+}
+
+sub secret_body {
+    my ($d, $pass, $mode) = @_;
+    my $origin = ($mode // 'random') eq 'derived'
+        ? "# Виведено з домену: HMAC-SHA512(майстер-ключ, $d).\n"
+        . "# Відновлюється з ключа: dcpmgmt secrets restore\n"
+        : "# Випадковий, нізвідки не відновлюється. Втратили файл —\n"
+        . "# міняйте пароль у самій БД.\n";
+    return "# Пароль БД для $d. Згенеровано dcpmgmt, у git не потрапляє.\n"
+         . $origin
+         . "# Підключається через env_file у docker-compose.domains/$d.yml.\n"
+         . "# Зміна пароля тут НЕ змінює його в уже ініціалізованій БД —\n"
+         . "# спершу ALTER USER у самій MariaDB, потім правка цього файла.\n"
+         . "MYSQL_PASSWORD=$pass\n"
+         . "WORDPRESS_DB_PASSWORD=$pass\n";
+}
+
+# ─────────────────────── генерація nginx-конфігів ───────────────────────
+
+sub listen443_block {
+    my ($e) = @_;
+    my $d = $e->{domain};
+    my @l;
+    my $h3 = ($e->{http3} // 'on') eq 'on';
+    if ($h3) {
+        # reuseport на спільному порті 443 має стояти РІВНО в одному vhost
+        # на весь стек, інакше nginx падає з "duplicate listen options",
+        # показуючи при цьому на чужий файл (той, що вантажиться пізніше
+        # за абеткою), а не на винуватця.
+        my $ru = (lc($CFG{quic_reuseport_domain} // '') eq lc $d) ? ' reuseport' : '';
+        push @l, "    listen 443 quic$ru;";
+    }
+    push @l, '    listen 443 ssl;';
+    push @l, '    listen [::]:443 ssl;';
+    push @l, '    http2 on;';
+    if ($h3) {
+        push @l, '    http3 on;';
+        push @l, '    quic_gso on;';
+        push @l, '    quic_retry on;';
+    }
+    return join "\n", @l;
+}
+
+sub alt_svc_line {
+    my ($e) = @_;
+    return '' unless ($e->{http3} // 'on') eq 'on';
+    return qq{    add_header Alt-Svc 'h3=":443"; h3-29=":443"; ma=86400';\n};
+}
+
+sub nginx_conf_path { my ($d) = @_; "$ROOT/nginx/nginx-$d.conf" }
+
+sub nginx_conf_body {
+    my ($e) = @_;
+    my $d    = $e->{domain};
+    my %v = (
+        domain     => $d,
+        webroot    => "/var/www/html/$d",
+        listen443  => listen443_block($e),
+        alt_svc    => alt_svc_line($e),
+        target     => $e->{target}      // '',
+        upstream   => $e->{upstream}    // '',
+        php_service=> $e->{php_service} // ('wordpress-' . sid_of($d)),
+    );
+    # Поки сертифіката фізично немає — віддаємо :80-заглушку. ssl_certificate
+    # на неіснуючий файл валить увесь nginx, а не тільки цей сайт, тож
+    # згенерований конфіг НІКОЛИ не посилається на відсутній сертифікат.
+    return render_template('nginx-bootstrap.conf.tmpl', %v) unless cert_live($d);
+    return render_template("nginx-$e->{type}.conf.tmpl", %v);
+}
+
+# ─────────────────────── генерація docker-compose ───────────────────────
+
+sub domain_yml_path { my ($d) = @_; "$ROOT/docker-compose.domains/$d.yml" }
+
+# Файл домену включається в стек, тільки якщо він існує і вже заповнений:
+# каркас proxy-сайту з CHANGE-ME навмисно лишається поза стеком, щоб
+# `docker compose up` не спіткнувся об неіснуючий образ.
+sub domain_yml_ready {
+    my ($d) = @_;
+    my $c = slurp(domain_yml_path($d));
+    return 0 unless defined $c;
+    return 0 if $c =~ /CHANGE-ME/;
+    return 1;
+}
+
+sub domain_yml_body {
+    my ($e) = @_;
+    my $d = $e->{domain};
+    return undef if $e->{type} eq 'redirect';   # редіректу контейнер не потрібен
+    my %v = (
+        domain     => $d,
+        sid        => sid_of($d),
+        sites_root => $CFG{sites_root},
+        wp_image   => $e->{image}    || $CFG{wordpress_image},
+        db_image   => $e->{db_image} || $CFG{db_image},
+        db_name    => $e->{db_name}  || db_name_of($d),
+        db_user    => $e->{db_user}  || db_user_of($d),
+        upstream   => $e->{upstream} // '',
+        app_service=> $e->{app_service} || upstream_host($e->{upstream} // ''),
+    );
+    return render_template('domain-wordpress.yml.tmpl', %v) if $e->{type} eq 'wordpress';
+    return render_template('domain-proxy.yml.tmpl', %v);
+}
+
+sub upstream_host {
+    my ($u) = @_;
+    $u =~ s/:\d+$//;
+    return $u;
+}
+
+# Webroot домену так, як його бачать webserver і certbot.
+#   WordPress — named volume: той самий каталог ділять php-fpm і nginx,
+#               оголошення bind'а живе в одному місці (файлі домену).
+#   redirect/proxy — прямий bind: контейнера-власника немає взагалі.
+sub webroot_mount {
+    my ($e, $ro) = @_;
+    my $d = $e->{domain};
+    return 'wordpress-' . sid_of($d) . ":/var/www/html/$d" if $e->{type} eq 'wordpress';
+    return "$CFG{sites_root}/$d/web:/var/www/html/$d" . ($ro ? ':ro' : '');
+}
+
+sub main_nginx_conf_path { "$ROOT/nginx/nginx.conf" }
+
+sub quic_bpf_enabled { lc($CFG{quic_bpf} // 'off') eq 'on' }
+
+sub main_nginx_conf_body {
+    return render_template('nginx.conf.tmpl',
+        worker_processes => $CFG{worker_processes},
+        quic_bpf         => quic_bpf_enabled() ? "quic_bpf on;\n" : '',
+    );
+}
+
+sub compose_main_body {
+    my (@doms) = @_;
+    my (@deps, @wsvol, @cbvol);
+    for my $e (@doms) {
+        my $d = $e->{domain};
+        push @deps, '      - wordpress-' . sid_of($d) if $e->{type} eq 'wordpress';
+        push @deps, "      - $e->{app_service}"
+            if $e->{type} eq 'proxy' && $e->{app_service} && domain_yml_ready($d);
+        push @wsvol, "      - ./nginx/nginx-$d.conf:/etc/nginx/conf.d/$d.conf:ro";
+        push @wsvol, '      - ' . webroot_mount($e, 1);
+        push @cbvol, '      - ' . webroot_mount($e, 0);
+    }
+    my $deps = @deps ? "    depends_on:\n" . join("\n", @deps) : '';
+    # Власний головний конфіг, якщо він є. Директиви головного контексту
+    # (quic_bpf, worker_processes) у conf.d не працюють — лише тут.
+    unshift @wsvol, '      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro'
+        if -f main_nginx_conf_path();
+    my %v = (
+        %CFG,
+        webserver_depends    => $deps,
+        webserver_volumes    => join("\n", @wsvol),
+        webserver_privileges => webserver_privileges(),
+        certbot_volumes      => join("\n", @cbvol),
+    );
+    my $body = render_template('compose-main.yml.tmpl', %v);
+    # Порожній {{webserver_depends}} (стек без жодного контейнерного домену)
+    # лишає по собі зайвий порожній рядок посеред YAML.
+    $body =~ s/\n\n+/\n\n/g;
+    return $body;
+}
+
+# nginx вантажить eBPF-програму сам, зсередини контейнера. Типовий профіль
+# seccomp у docker блокує виклик bpf() усім, крім CAP_SYS_ADMIN, тож самих
+# лише capabilities замало — профіль доводиться послабити.
+sub webserver_privileges {
+    return '' unless quic_bpf_enabled();
+    return join "\n",
+        '    cap_add:',
+        '      - BPF',
+        '      - NET_ADMIN',
+        '    security_opt:',
+        '      - seccomp:unconfined';
+}
+
+sub compose_root_body {
+    my (@doms) = @_;
+    my @inc = map  { "  - docker-compose.domains/$_->{domain}.yml" }
+              grep { domain_yml_ready($_->{domain}) } @doms;
+    return render_template('compose-root.yml.tmpl',
+        project  => $CFG{project},
+        includes => join("\n", @inc),
+    );
+}
+
+# ─────────────────────────── render ───────────────────────────
+
+sub ensure_site_dirs {
+    my ($e) = @_;
+    my $d = $e->{domain};
+    for my $sub ($e->{type} eq 'wordpress' ? ('web', 'db') : ('web')) {
+        my $p = "$CFG{sites_root}/$d/$sub";
+        next if -d $p;
+        make_path($p) or die_err "не можу створити $p: $!";
+        # web-корінь WordPress віддаємо www-data (uid/gid 33 у Debian-образах):
+        # php-fpm пише туди оновлення й завантаження. Каталог БД чіпати не
+        # треба — mariadb сама перебирає його на себе при першому старті.
+        chown(33, 33, $p) if $sub eq 'web' && $e->{type} eq 'wordpress' && $> == 0;
+        say_ok "створено $p";
+    }
+}
+
+sub render_all {
+    my (%o) = @_;
+    my @all  = reg_enabled();
+    my %only = map { $_ => 1 } @{ $o{only} || [] };
+    # Файли генеруються для @doms (можливо, одного домену), а зведені
+    # docker-compose.yml і .main.yml — завжди для всього реєстру.
+    my @doms = %only ? grep { $only{$_->{domain}} } @all : @all;
+
+    for my $e (@doms) {
+        my $d = $e->{domain};
+        ensure_site_dirs($e) unless $o{no_dirs};
+        secret_ensure($e) if $e->{type} eq 'wordpress';
+
+        for my $hook ("$ROOT/nginx/custom/$d.conf",
+                      ($e->{type} eq 'wordpress' ? "$ROOT/nginx/custom/$d.php.conf" : ())) {
+            next if -f $hook;
+            write_file($hook,
+                "# Правки для $d, які переживають `dcpmgmt render --force`.\n"
+              . "# Цей файл dcpmgmt не перезаписує ніколи. Порожній — це нормально.\n",
+                quiet => 1);
+        }
+
+        write_file(nginx_conf_path($d), nginx_conf_body($e), %o);
+        if ($e->{type} eq 'redirect') {
+            my $idx = "$CFG{sites_root}/$d/web/index.html";
+            write_file($idx, render_template('redirect-index.html.tmpl', target => $e->{target}), %o)
+                unless $o{no_dirs};
+        }
+        my $yml = domain_yml_body($e);
+        if (defined $yml) {
+            # Файл proxy-домену описує ЧУЖИЙ застосунок і належить адміну:
+            # --force регенерує наші шаблони, а не чужу роботу. Щоб отримати
+            # свіжий каркас — видаліть файл і повторіть render.
+            my %fo = $e->{type} eq 'proxy' ? (%o, force => 0, owned_by_admin => 1) : %o;
+            write_file(domain_yml_path($d), $yml, %fo);
+        }
+        elsif (-f domain_yml_path($d)) {
+            # redirect обслуговує сам nginx: контейнер-пустушка (alpine у
+            # вічному sleep) існував лише щоб створити named volume.
+            if ($o{force}) {
+                rename domain_yml_path($d), domain_yml_path($d) . '.bak';
+                say_ok "docker-compose.domains/$d.yml — прибрано (редіректу контейнер не потрібен), копія в .bak";
+            } else {
+                say_warn "docker-compose.domains/$d.yml зайвий: редірект обслуговує nginx, "
+                       . 'контейнер не потрібен (--force прибере, зберігши .bak)';
+            }
+        }
     }
 
-    location = /favicon.ico {
-            log_not_found off; access_log off;
-    }
-    location = /robots.txt {
-            log_not_found off; access_log off; allow all;
-    }
-    location ~* \.(css|gif|ico|jpeg|jpg|js|png)\$ {
-            expires max;
-            log_not_found off;
-    }
-}
-EOF
-}
-
-write_nginx_redirect_conf() {
-    local alias="$1" target="$2"
-    cat > "${NGINX_CONF_DIR}/nginx-${alias}.conf" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${alias};
-    location ~ /.well-known/acme-challenge {
-        allow all;
-        root /var/www/html/${alias};
-    }
-    location / {
-        return 302 https://${target}\$request_uri;
-    }
-}
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
-    server_name ${alias};
-
-    index index.html index.htm;
-
-    root /var/www/html/${alias};
-
-    server_tokens off;
-    ssl_certificate /etc/letsencrypt/live/${alias}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${alias}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${alias}/chain.pem;
-
-    location / {
-            try_files \$uri \$uri/ /index.php\$is_args\$args;
+    if (quic_bpf_enabled()) {
+        write_file(main_nginx_conf_path(), main_nginx_conf_body(), %o);
+        say_warn 'quic_bpf = on: webserver отримує CAP_BPF, CAP_NET_ADMIN і '
+               . 'seccomp:unconfined — це контейнер, що дивиться в інтернет.';
+        say_warn 'Одразу після apply перевірте `docker logs webserver`: якщо ядро '
+               . 'або docker не дають bpf(), nginx не підніметься, а він один на всі домени.';
+        say_warn 'Відкат: quic_bpf = off у dcp.conf, потім dcpmgmt apply.';
     }
 
-    location ~ /\.ht {
-            deny all;
-    }
+    # ці два файли повністю належать інструменту — завжди перезаписуються
+    my %own = (%o, force => 1);
+    write_file("$ROOT/docker-compose.main.yml", compose_main_body(@all), %own);
+    write_file("$ROOT/docker-compose.yml",      compose_root_body(@all), %own);
 
-    location = /favicon.ico {
-            log_not_found off; access_log off;
-    }
-    location = /robots.txt {
-            log_not_found off; access_log off; allow all;
-    }
-    location ~* \.(css|gif|ico|jpeg|jpg|js|png)\$ {
-            expires max;
-            log_not_found off;
+    for my $e (@all) {
+        next unless $e->{type} eq 'proxy';
+        next if domain_yml_ready($e->{domain});
+        say_warn "docker-compose.domains/$e->{domain}.yml ще містить CHANGE-ME — "
+               . "домен поза стеком, nginx для нього не підніметься (host not found in upstream)";
     }
 }
-EOF
-}
 
-write_redirect_index_html() {
-    local alias="$1" target="$2"
-    cat > "${SITES_ROOT}/${alias}/web/index.html" <<EOF
-<!DOCTYPE HTML>
-<html lang="en-US">
-    <head>
-        <meta charset="UTF-8">
-        <meta http-equiv="refresh" content="0; url=https://${target}">
-        <script type="text/javascript">
-            window.location.href = "https://${target}"
-        </script>
-        <title>Page Redirection</title>
-    </head>
-    <body>
-        If you are not redirected automatically, follow this <a href='https://${target}'>link to example</a>.
-    </body>
-</html>
-EOF
-}
+# ─────────────────────────── сертифікати ───────────────────────────
 
-write_nginx_proxy_conf() {
-    local domain="$1" upstream="$2"
-    cat > "${NGINX_CONF_DIR}/nginx-${domain}.conf" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-    location ~ /.well-known/acme-challenge {
-        allow all;
-        root /var/www/html/${domain};
-        try_files \$uri =404;
+sub cert_issue {
+    my ($d, %o) = @_;
+    if (cert_live($d) && !$o{force}) {
+        say_ok "сертифікат для $d вже є — видачу пропущено";
+        return 1;
     }
-    location / {
-        return 302 https://${domain}\$request_uri;
+    unless (container_running('webserver')) {
+        die_err "webserver не працює, а Let's Encrypt має достукатись до\n"
+              . "       http://$d/.well-known/acme-challenge/. Спершу: dcpmgmt apply";
+    }
+    say_step "Первинна видача сертифіката для $d";
+    say_info 'вимоги: A/AAAA-запис уже вказує на цей сервер, порт 80 доступний ззовні,';
+    say_info 'а якщо домен за Cloudflare — проксі поки вимкнено (сіра хмарка).';
+
+    # Одноразовий контейнер, а не `docker exec` у certbot: той сидить у циклі
+    # renew і тримає lock — exec впаде з "Another instance of Certbot is
+    # already running". Монтуємо шляхи хоста напряму, щоб не залежати від
+    # префікса імені compose-проєкту в назвах volume'ів.
+    my @cmd = (
+        'docker', 'run', '--rm',
+        '-v', "$CFG{letsencrypt_dir}/etc:/etc/letsencrypt",
+        '-v', "$CFG{letsencrypt_dir}/var:/var/lib/letsencrypt",
+        '-v', "$CFG{sites_root}/$d/web:/var/www/html/$d",
+        $CFG{certbot_image}, 'certonly', '--webroot',
+        '--webroot-path', "/var/www/html/$d",
+        '-d', $d,
+        '--email', $CFG{certbot_email},
+        '--agree-tos', '--no-eff-email', '--non-interactive',
+    );
+    push @cmd, '--staging'      if $o{staging};
+    push @cmd, '--force-renewal' if $o{force};
+
+    unless (run(@cmd)) {
+        die_err "certbot не видав сертифікат для $d.\n"
+              . "       Найчастіші причини: DNS ще не вказує сюди; порт 80 закрито;\n"
+              . "       Cloudflare-проксі увімкнено; вичерпано ліміт Let's Encrypt\n"
+              . "       (5 невдалих валідацій/год, 50 сертифікатів/тиждень на домен).\n"
+              . "       Ліміти НЕ обходяться повторами наосліп — розберіться з причиною.\n"
+              . "       Для перевірки без витрати лімітів: dcpmgmt cert issue $d --staging";
+    }
+    say_ok "сертифікат для $d отримано";
+    return 1;
+}
+
+sub cmd_cert {
+    my @args = @_;
+    my $sub = shift @args // '';
+    my ($staging, $force) = (0, 0);
+    GetOptionsFromArray(\@args, 'staging' => \$staging, 'force' => \$force)
+        or die_err 'невідомий ключ';
+    my $d = shift @args;
+
+    if ($sub eq 'issue') {
+        die_err 'потрібен домен: dcpmgmt cert issue <domain>' unless $d;
+        die_err "домену $d немає в реєстрі" unless reg_load_one($d);
+        cert_issue($d, staging => $staging, force => $force);
+        render_all(force => 1, only => [$d]);
+        nginx_test_reload();
+    }
+    elsif ($sub eq 'renew') {
+        my @doms = $d ? ($d) : map { $_->{domain} } reg_enabled();
+        for my $dom (@doms) {
+            my @cmd = (
+                'docker', 'run', '--rm',
+                '-v', "$CFG{letsencrypt_dir}/etc:/etc/letsencrypt",
+                '-v', "$CFG{letsencrypt_dir}/var:/var/lib/letsencrypt",
+                '-v', "$CFG{sites_root}/$dom/web:/var/www/html/$dom",
+                $CFG{certbot_image}, 'renew', '--cert-name', $dom,
+            );
+            push @cmd, '--force-renewal' if $force;
+            run(@cmd) or say_warn "renew для $dom завершився помилкою";
+        }
+        nginx_test_reload();
+    }
+    elsif ($sub eq 'list') {
+        for my $e (reg_all()) {
+            my $d2 = $e->{domain};
+            printf "  %-34s %s\n", $d2, cert_expiry($d2) // c('1;31', 'сертифіката немає');
+        }
+    }
+    else {
+        die_err 'dcpmgmt cert issue|renew|list [<domain>] [--staging] [--force]';
     }
 }
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
-    server_name ${domain};
 
-    server_tokens off;
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${domain}/chain.pem;
+sub cert_expiry {
+    my ($d) = @_;
+    my $pem = cert_dir($d) . '/cert.pem';
+    return undef unless -e $pem;
+    my $out = capture('openssl', 'x509', '-enddate', '-noout', '-in', $pem);
+    my ($date) = $out =~ /notAfter=(.+)/;
+    return $date ? "діє до $date" : 'сертифікат є';
+}
 
-    location / {
-        proxy_pass http://${upstream}/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 90s;
-        proxy_connect_timeout 90s;
-        proxy_send_timeout 90s;
+# ─────────────────────────── команди ───────────────────────────
+
+sub cmd_init {
+    my @args = @_;
+    say_step 'Ініціалізація проєкту';
+    unless (-f "$ROOT/dcp.conf") {
+        my $ex = slurp("$ROOT/dcp.conf.example") or die_err 'немає dcp.conf.example';
+        write_file("$ROOT/dcp.conf", $ex, mode => 0600);
+        say_warn 'створено dcp.conf із прикладу — ВИПРАВТЕ certbot_email і project, потім повторіть init';
+        exit 0;
+    }
+    load_config();
+
+    for my $d (reg_dir(), "$ROOT/secrets", "$ROOT/nginx/custom",
+               "$ROOT/docker-compose.domains",
+               $CFG{sites_root}, $CFG{nginx_conf_dir},
+               "$CFG{letsencrypt_dir}/etc", "$CFG{letsencrypt_dir}/var") {
+        next if -d $d;
+        make_path($d) or die_err "не можу створити $d: $!";
+        say_ok "створено $d";
+    }
+    chmod 0700, "$ROOT/secrets";
+
+    render_all();
+    say_ok 'структура готова';
+    print <<"TXT";
+
+Далі:
+  dcpmgmt add wordpress example.com      — повноцінний сайт
+  dcpmgmt add redirect old.example.com --to example.com
+  dcpmgmt add proxy api.example.com --upstream my-app:8080
+  dcpmgmt apply                          — підняти стек
+
+Успадкована інсталяція (стек уже працює, файли є):
+  dcpmgmt import      — зібрати реєстр із наявних конфігів, нічого не ламаючи
+TXT
+}
+
+sub cmd_add {
+    my @args = @_;
+    my $type = shift @args // '';
+    die_err 'тип має бути wordpress | redirect | proxy'
+        unless $type =~ /^(wordpress|redirect|proxy)$/;
+
+    my ($target, $upstream, $image, $http3, $no_cert, $staging) = ('', '', '', 'on', 0, 0);
+    GetOptionsFromArray(\@args,
+        'to=s'       => \$target,
+        'upstream=s' => \$upstream,
+        'image=s'    => \$image,
+        'http3!'     => sub { $http3 = $_[1] ? 'on' : 'off' },
+        'no-cert'    => \$no_cert,
+        'staging'    => \$staging,
+    ) or die_err 'невідомий ключ';
+
+    my $d = lc(shift(@args) // '');
+    die_err 'потрібне ім\'я домену' unless $d;
+    die_err "'$d' не схоже на ім'я домену (для кирилиці вживайте punycode: xn--...)"
+        unless valid_domain($d);
+    die_err "домен $d уже є в реєстрі (domains/$d.conf)" if reg_load_one($d);
+    die_err 'redirect потребує --to <домен-призначення>' if $type eq 'redirect' && !$target;
+    die_err 'proxy потребує --upstream <host:port>'      if $type eq 'proxy'    && !$upstream;
+    die_err "--to <domain>: '$target' не схоже на домен"
+        if $target && !valid_domain($target);
+
+    load_config();
+
+    my $e = {
+        domain => $d, type => $type, http3 => $http3, enabled => 'yes',
+        ($target   ? (target   => $target)   : ()),
+        ($upstream ? (upstream => $upstream, app_service => upstream_host($upstream)) : ()),
+        ($image    ? (image    => $image)    : ()),
+    };
+    if ($type eq 'wordpress') {
+        $e->{db_name}     = db_name_of($d);
+        $e->{db_user}     = db_user_of($d);
+        $e->{php_service} = 'wordpress-' . sid_of($d);
+        $e->{image}     ||= $CFG{wordpress_image};
+    }
+    $e->{password_mode} = $CFG{password_mode} if $type eq 'wordpress';
+    reg_save($e);
+    say_ok "domains/$d.conf — створено";
+
+    say_step "Крок 1/4: файли та структура";
+    render_all(only => [$d]);
+
+    say_step 'Крок 2/4: піднімаємо стек (nginx поки з :80-заглушкою для нового домену)';
+    compose('up', '-d', '--remove-orphans') or die_err 'docker compose up завершився помилкою';
+    nginx_test_reload();
+
+    unless ($no_cert) {
+        say_step 'Крок 3/4: сертифікат';
+        cert_issue($d, staging => $staging);
+        say_step 'Крок 4/4: бойовий nginx-конфіг з 443';
+        render_all(force => 1, only => [$d]);
+        compose('up', '-d', '--remove-orphans');
+        nginx_test_reload();
+    } else {
+        say_warn 'видачу сертифіката пропущено (--no-cert): домен віддає :80-заглушку.';
+        say_warn "коли DNS буде готовий — dcpmgmt cert issue $d";
+    }
+
+    print "\n";
+    if ($type eq 'wordpress') {
+        say_ok "готово: https://$d/wp-admin/install.php — лишилось пройти майстер WordPress";
+        say_info "БД, користувач і пароль уже створені й прописані у wp-config.php;";
+        say_info 'майстер спитає лише назву сайту й адміна.';
+    } elsif ($type eq 'redirect') {
+        say_ok "готово: https://$d/ -> https://$target/ (301, плюс index.html як підстраховка)";
+    } else {
+        say_ok "готово: https://$d/ -> http://$upstream/";
+        say_info "опишіть сервіс застосунку в docker-compose.domains/$d.yml (заміна CHANGE-ME),";
+        say_info 'потім: dcpmgmt apply';
     }
 }
-EOF
+
+sub cmd_remove {
+    my @args = @_;
+    my $purge = 0;
+    GetOptionsFromArray(\@args, 'purge' => \$purge) or die_err 'невідомий ключ';
+    my $d = lc(shift(@args) // '');
+    die_err 'потрібне ім\'я домену' unless $d;
+    load_config();
+    my $e = reg_load_one($d) or die_err "домену $d немає в реєстрі";
+
+    my $what = $purge
+        ? "домен $d РАЗОМ з файлами $CFG{sites_root}/$d (web + база даних!) і сертифікатом"
+        : "домен $d зі стека (файли $CFG{sites_root}/$d і сертифікат ЛИШАЮТЬСЯ)";
+    confirm("Видалити $what?") or do { say_info 'скасовано'; return };
+
+    my $sid = sid_of($d);
+    my @svc = $e->{type} eq 'wordpress' ? ("wordpress-$sid", "db-$sid")
+            : $e->{type} eq 'proxy' && $e->{app_service} ? ($e->{app_service}) : ();
+    if (@svc) {
+        compose('stop', @svc);
+        compose('rm', '-f', '-v', @svc);
+    }
+
+    unlink reg_path($d), nginx_conf_path($d), domain_yml_path($d);
+    unlink "$ROOT/nginx/custom/$d.conf", "$ROOT/nginx/custom/$d.php.conf";
+    say_ok "реєстр і згенеровані конфіги для $d прибрано";
+
+    render_all();
+    compose('up', '-d', '--remove-orphans');
+    nginx_test_reload();
+
+    if ($purge) {
+        run('docker', 'run', '--rm',
+            '-v', "$CFG{letsencrypt_dir}/etc:/etc/letsencrypt",
+            '-v', "$CFG{letsencrypt_dir}/var:/var/lib/letsencrypt",
+            $CFG{certbot_image}, 'delete', '--cert-name', $d, '--non-interactive');
+        remove_tree("$CFG{sites_root}/$d");
+        unlink secret_path($d);
+        say_ok "прибрано $CFG{sites_root}/$d, сертифікат і secrets/$d.env";
+    } else {
+        say_info "дані лишились: $CFG{sites_root}/$d, secrets/$d.env, сертифікат у letsencrypt";
+        say_info "повне прибирання: dcpmgmt remove $d --purge (спершу поверніть домен у реєстр)";
+    }
 }
 
-# ───────────────────────── Шаблони docker-compose.domains ─────────────────────────
-
-write_compose_wp_yml() {
-    local domain="$1" service="$2" image="$3"
-    local dbuser dbpass
-    dbuser="$(db_user_for "$domain")"
-    dbpass="$(random_password)"
-    cat > "${DOMAINS_YML_DIR}/${domain}.yml" <<EOF
-services:
-  wordpress-${service}:
-    image: ${image}
-    restart: unless-stopped
-    container_name: wordpress-${service}
-    environment:
-      WORDPRESS_DB_HOST: db-${service}
-      WORDPRESS_DB_USER: ${dbuser}
-      WORDPRESS_DB_PASSWORD: ${dbpass}
-      WORDPRESS_DB_NAME: ${service}
-    volumes:
-      - wordpress-${service}:/var/www/html/${domain}
-    depends_on:
-      - db-${service}
-    networks:
-      - app-network
-
-  db-${service}:
-    image: ${DEFAULT_DB_IMAGE}
-    restart: unless-stopped
-    container_name: db-${service}
-    command:
-      - '--skip-log-bin'
-    environment:
-      MYSQL_DATABASE: ${service}
-      MYSQL_USER: ${dbuser}
-      MYSQL_PASSWORD: ${dbpass}
-      MYSQL_RANDOM_ROOT_PASSWORD: '1'
-    cap_add:
-      - CAP_SYS_NICE
-    security_opt:
-      - seccomp:unconfined
-    volumes:
-      - db-${service}:/var/lib/mysql
-    networks:
-      - app-network
-    healthcheck:
-      timeout: 20s
-      retries: 10
-      test: [ "CMD", "mariadb-admin", "ping", "-hlocalhost", "-u${dbuser}", "-p${dbpass}" ]
-
-  certbot-${service}:
-    image: certbot/certbot
-    container_name: certbot-${service}
-    depends_on:
-      - webserver
-    volumes:
-      - certbot-etc:/etc/letsencrypt
-      - certbot-var:/var/lib/letsencrypt
-      - wordpress-${service}:/var/www/html/${domain}
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --cert-name ${domain}; sleep 12h & wait \$\${!}; done;'"
-
-volumes:
-  wordpress-${service}:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${SITES_ROOT}/${domain}/web
-  db-${service}:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${SITES_ROOT}/${domain}/db
-EOF
-    log "Створено ${DOMAINS_YML_DIR}/${domain}.yml (db_user=${dbuser})"
+sub cmd_list {
+    my @args = @_;
+    my ($names, $type) = (0, '');
+    GetOptionsFromArray(\@args, 'names' => \$names, 'type=s' => \$type)
+        or die_err 'невідомий ключ';
+    load_config();
+    my @doms = reg_all();
+    @doms = grep { $_->{type} eq $type } @doms if $type;
+    if ($names) {                       # для скриптів: по домену на рядок
+        print "$_->{domain}\n" for @doms;
+        return;
+    }
+    unless (@doms) { say_info 'реєстр порожній — почніть з dcpmgmt add ... або dcpmgmt import'; return }
+    printf "%-34s %-10s %-28s %-5s %s\n", 'ДОМЕН', 'ТИП', 'ПРИЗНАЧЕННЯ', 'H3', 'СЕРТИФІКАТ';
+    for my $e (@doms) {
+        my $d = $e->{domain};
+        my $dest = $e->{type} eq 'redirect' ? "-> $e->{target}"
+                 : $e->{type} eq 'proxy'    ? "-> $e->{upstream}"
+                 : ($e->{image} // '');
+        printf "%-34s %-10s %-28s %-5s %s\n",
+            $d, $e->{type}, $dest, ($e->{http3} eq 'on' ? 'так' : 'ні'),
+            (cert_live($d) ? 'є' : c('1;31', 'НЕМАЄ'));
+    }
 }
 
-write_compose_redirect_yml() {
-    local alias="$1" service="$2"
-    cat > "${DOMAINS_YML_DIR}/${alias}.yml" <<EOF
-services:
-  redirect-${service}:
-    container_name: redirect-${service}
-    entrypoint:
-      - /bin/sh
-      - -c
-      - trap exit TERM; while :; do sleep 24h & wait \$\${!}; done;
-    image: alpine:latest
-    networks:
-      - app-network
-    restart: unless-stopped
-    volumes:
-      - redirect-${service}:/var/www/html/${alias}
-
-  certbot-${service}:
-    image: certbot/certbot
-    container_name: certbot-${service}
-    depends_on:
-      - webserver
-    volumes:
-      - certbot-etc:/etc/letsencrypt
-      - certbot-var:/var/lib/letsencrypt
-      - redirect-${service}:/var/www/html/${alias}
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --cert-name ${alias}; sleep 12h & wait \$\${!}; done;'"
-
-volumes:
-  redirect-${service}:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${SITES_ROOT}/${alias}/web
-EOF
-    log "Створено ${DOMAINS_YML_DIR}/${alias}.yml"
+sub cmd_render {
+    my @args = @_;
+    my ($force, $diff) = (0, 0);
+    GetOptionsFromArray(\@args, 'force' => \$force, 'diff' => \$diff)
+        or die_err 'невідомий ключ';
+    load_config();
+    render_all(force => $force, diff => $diff, (@args ? (only => \@args) : ()));
+    say_info 'застосувати до працюючого стека: dcpmgmt apply' unless $diff;
 }
 
-write_compose_proxy_yml() {
-    local domain="$1" service="$2"
-    cat > "${DOMAINS_YML_DIR}/${domain}.yml" <<EOF
-# Основа для проксі-сайту ${domain}. Сервіс застосунку (upstream) — не тут,
-# додайте власний service-блок нижче вручну (image/volumes/оточення застосунку).
-# Не забудьте networks: [app-network] і назву, що збігається з upstream
-# в nginx/nginx-${domain}.conf (proxy_pass).
-
-services:
-  certbot-${service}:
-    image: certbot/certbot
-    container_name: certbot-${service}
-    depends_on:
-      - webserver
-    volumes:
-      - certbot-etc:/etc/letsencrypt
-      - certbot-var:/var/lib/letsencrypt
-      - proxywebroot-${service}:/var/www/html/${domain}
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --cert-name ${domain}; sleep 12h & wait \$\${!}; done;'"
-
-volumes:
-  proxywebroot-${service}:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${SITES_ROOT}/${domain}/web
-EOF
-    log "Створено ${DOMAINS_YML_DIR}/${domain}.yml (заготовка — дозаповніть service застосунку вручну)"
+# Хеш кожного сервісу з поточної конфігурації compose. Саме за ним compose
+# вирішує, чи перестворювати контейнер — тож порівняння «до/після» точно
+# відповідає на питання «що саме смикне apply».
+sub service_hashes {
+    return {} unless have_docker();
+    chdir $ROOT;
+    return {} unless -f "$ROOT/docker-compose.yml";
+    my $out = capture('docker', 'compose', 'config', '--hash=*');
+    my %h;
+    for my $l (split /\n/, $out) {
+        my ($s, $hash) = $l =~ /^(\S+)\s+(\S+)$/ or next;
+        $h{$s} = $hash;
+    }
+    return \%h;
 }
 
-# ───────────────────────── Отримання сертифіката (bootstrap) ─────────────────────────
-
-issue_cert_bootstrap() {
-    local domain="$1"
-    log "Первинне отримання сертифіката для ${domain} (webroot: ${SITES_ROOT}/${domain}/web) ..."
-    docker run --rm \
-        -v docker-compose-project_certbot-etc:/etc/letsencrypt \
-        -v docker-compose-project_certbot-var:/var/lib/letsencrypt \
-        -v "${SITES_ROOT}/${domain}/web:/var/www/html/${domain}" \
-        certbot/certbot certonly --webroot \
-            --email "${CERTBOT_EMAIL}" --agree-tos --no-eff-email \
-            --webroot-path="/var/www/html/${domain}" \
-            -d "${domain}" --non-interactive
-    log "Сертифікат для ${domain} отримано."
+sub report_impact {
+    my ($before, $after) = @_;
+    return 0 unless %$before || %$after;
+    my (@new, @gone, @changed);
+    for my $s (sort keys %$after) {
+        push @new, $s unless exists $before->{$s};
+    }
+    for my $s (sort keys %$before) {
+        if (!exists $after->{$s})              { push @gone, $s }
+        elsif ($before->{$s} ne $after->{$s})  { push @changed, $s }
+    }
+    say_step 'Що зробить apply з контейнерами';
+    say_ok 'нічого не перестворюється' unless @new || @gone || @changed;
+    say_info 'створити:      ' . join(', ', @new)     if @new;
+    say_info 'перестворити:  ' . join(', ', @changed) if @changed;
+    say_info 'прибрати:      ' . join(', ', @gone)    if @gone;
+    if (grep { /^db-/ } @changed) {
+        say_warn 'серед них є контейнери БД. Дані лежать на хості в '
+               . "$CFG{sites_root}/<домен>/db і нікуди не діваються,";
+        say_warn 'але сайт на час перестворення (кілька секунд) віддаватиме помилку БД.';
+    }
+    return scalar(@new) + scalar(@gone) + scalar(@changed);
 }
 
-# ───────────────────────── Команди ─────────────────────────
+sub cmd_apply {
+    my @args = @_;
+    my $force = 0;
+    GetOptionsFromArray(\@args, 'force' => \$force) or die_err 'невідомий ключ';
+    load_config();
 
-cmd_add_site() {
-    local domain="$1" image="${2:-$DEFAULT_WP_IMAGE}"
-    local service; service="$(service_id "$domain")"
+    my $before = service_hashes();
+    say_step 'Генерація конфігурації з реєстру';
+    render_all(force => $force);
+    my $after = service_hashes();
+    report_impact($before, $after);
 
-    require_root_dir
-    [[ -f "${DOMAINS_YML_DIR}/${domain}.yml" ]] && die "${domain}.yml вже існує — домен вже доданий?"
-
-    log "=== add-site: ${domain} (service=${service}, image=${image}) ==="
-
-    ensure_webroot_dir "$domain"
-    mkdir -p "${SITES_ROOT}/${domain}/db"
-
-    write_nginx_bootstrap_conf "$domain"
-    docker exec webserver nginx -t
-    docker exec webserver nginx -s reload
-
-    issue_cert_bootstrap "$domain"
-
-    write_nginx_wp_conf "$domain" "wordpress-${service}"
-    write_compose_wp_yml "$domain" "$service" "$image"
-
-    compose_include_add "$domain"
-    webserver_deps_volumes_add "$domain" "wordpress-${service}" "1"
-
-    log "Піднімаю db-${service} і чекаю healthy ..."
-    docker compose up -d "db-${service}"
-    local tries=0
-    until [[ "$(docker inspect -f '{{.State.Health.Status}}' "db-${service}" 2>/dev/null)" == "healthy" ]]; do
-        sleep 3; tries=$((tries+1))
-        [[ $tries -gt 40 ]] && die "db-${service} не стала healthy за 2 хвилини — перевірте docker logs db-${service}"
-    done
-
-    log "Заповнюю web-теку файлами WordPress (${image}) ..."
-    docker run --rm -v "${SITES_ROOT}/${domain}/web:/target" "${image}" \
-        sh -c "cp -a /usr/src/wordpress/. /target/"
-
-    docker compose up -d "wordpress-${service}" "certbot-${service}"
-
-    nginx_test_and_reload
-
-    log "Готово. Відкрийте https://${domain}/wp-admin/install.php для завершення встановлення WordPress."
-    warn "Не забудьте після встановлення перевірити wp_options.siteurl/home (див. HOWTO-new-wordpress-site.md)."
+    unless (confirm('Застосувати до працюючого стека?')) { say_info 'скасовано'; return }
+    compose('up', '-d', '--remove-orphans') or die_err 'docker compose up завершився помилкою';
+    nginx_test_reload();
+    say_ok 'готово';
 }
 
-cmd_del_site() {
-    local domain="$1"
-    local service; service="$(service_id "$domain")"
-    require_root_dir
-    [[ -f "${DOMAINS_YML_DIR}/${domain}.yml" ]] || die "${domain}.yml не знайдено."
+# ─────────────────────────── import ───────────────────────────
+#
+# Успадкована інсталяція: стек уже працює, реєстру ще немає. Збираємо
+# реєстр із того, що є на диску, і НІЧОГО не змінюємо — ні контейнерів,
+# ні конфігів. Перевірити наслідки потім: dcpmgmt render --diff.
 
-    confirm "Точно видалити сайт ${domain} (контейнери + volumes + БД + файли в ${SITES_ROOT}/${domain})?" \
-        || { log "Скасовано."; return; }
+sub parse_nginx_conf {
+    my ($path, $domain) = @_;
+    my $c = nginx_uncommented($path) // return undef;
+    my %e = (domain => $domain, enabled => 'yes');
+    $e{http3} = $c =~ /^\s*http3\s+on;/m ? 'on' : 'off';
+    $e{_reuseport} = $c =~ /reuseport/ ? 1 : 0;
 
-    docker compose stop "wordpress-${service}" "db-${service}" "certbot-${service}" 2>/dev/null || true
-    docker compose rm -f "wordpress-${service}" "db-${service}" "certbot-${service}" 2>/dev/null || true
-    docker volume rm "docker-compose-project_wordpress-${service}" "docker-compose-project_db-${service}" 2>/dev/null || true
-
-    compose_include_remove "$domain"
-    webserver_deps_volumes_remove "$domain" "wordpress-${service}"
-
-    rm -f "${DOMAINS_YML_DIR}/${domain}.yml" "${NGINX_CONF_DIR}/nginx-${domain}.conf"
-
-    nginx_test_and_reload
-
-    if confirm "Прибрати також файли в ${SITES_ROOT}/${domain} (web+db)?"; then
-        sudo rm -rf "${SITES_ROOT:?}/${domain:?}"
-        log "Прибрано ${SITES_ROOT}/${domain}"
-    fi
-
-    log "Сайт ${domain} видалено. Сертифікат у certbot-etc НЕ видалявся автоматично (можна прибрати вручну)."
+    if (my ($php) = $c =~ /fastcgi_pass\s+([\w.-]+):9000;/) {
+        $e{type} = 'wordpress';
+        $e{php_service} = $php;
+    }
+    elsif (my ($up) = $c =~ m{proxy_pass\s+https?://([\w.:-]+)/?;}) {
+        $e{type} = 'proxy';
+        $e{upstream} = $up;
+        $e{app_service} = upstream_host($up);
+    }
+    else {
+        $e{type} = 'redirect';
+        my ($t) = grep { $_ ne $domain }
+                  ($c =~ m{return\s+30[12]\s+https://([\w.-]+)}g);
+        unless ($t) {
+            my $idx = "$CFG{sites_root}/$domain/web/index.html";
+            my $ic = slurp($idx) // '';
+            ($t) = $ic =~ m{url=https://([\w.-]+)};
+        }
+        $e{target} = $t if $t;
+    }
+    return \%e;
 }
 
-cmd_add_redirect_site() {
-    local alias="$1" target="$2"
-    local service; service="$(service_id "$alias")"
-
-    require_root_dir
-    [[ -f "${DOMAINS_YML_DIR}/${alias}.yml" ]] && die "${alias}.yml вже існує."
-
-    log "=== add-redirect-site: ${alias} -> ${target} (service=${service}) ==="
-
-    ensure_webroot_dir "$alias"
-
-    write_nginx_bootstrap_conf "$alias"
-    docker exec webserver nginx -t
-    docker exec webserver nginx -s reload
-
-    issue_cert_bootstrap "$alias"
-
-    write_nginx_redirect_conf "$alias" "$target"
-    write_redirect_index_html "$alias" "$target"
-    write_compose_redirect_yml "$alias" "$service"
-
-    compose_include_add "$alias"
-    webserver_deps_volumes_add "$alias" "redirect-${service}" "1"
-
-    docker compose up -d "redirect-${service}" "certbot-${service}"
-
-    nginx_test_and_reload
-
-    log "Готово: https://${alias}/ -> https://${target}/"
+sub parse_domain_yml {
+    my ($path) = @_;
+    my $c = slurp($path) // return {};
+    my %y;
+    ($y{image})    = $c =~ /^\s*image:\s*(wordpress:\S+)/m;
+    ($y{db_image}) = $c =~ /^\s*image:\s*(mariadb\S*|mysql\S*)/m;
+    ($y{db_name})  = $c =~ /MYSQL_DATABASE:\s*(\S+)/;
+    ($y{db_user})  = $c =~ /MYSQL_USER:\s*(\S+)/;
+    ($y{password}) = $c =~ /MYSQL_PASSWORD:\s*(\S+)/;
+    delete $y{$_} for grep { !defined $y{$_} } keys %y;
+    return \%y;
 }
 
-cmd_del_redirect_site() {
-    local alias="$1"
-    local service; service="$(service_id "$alias")"
-    require_root_dir
-    [[ -f "${DOMAINS_YML_DIR}/${alias}.yml" ]] || die "${alias}.yml не знайдено."
+sub cmd_import {
+    my @args = @_;
+    my $src = $ROOT;
+    GetOptionsFromArray(\@args, 'from=s' => \$src) or die_err 'невідомий ключ';
+    load_config();
+    $src = abs_path($src) or die_err 'немає такого каталогу';
 
-    confirm "Видалити redirect-сайт ${alias}?" || { log "Скасовано."; return; }
+    my @confs = glob("$src/nginx/nginx-*.conf");
+    die_err "у $src/nginx/ не знайдено жодного nginx-*.conf" unless @confs;
 
-    docker compose stop "redirect-${service}" "certbot-${service}" 2>/dev/null || true
-    docker compose rm -f "redirect-${service}" "certbot-${service}" 2>/dev/null || true
-    docker volume rm "docker-compose-project_redirect-${service}" 2>/dev/null || true
+    my ($n, @notes, @reuse) = (0);
+    for my $path (sort @confs) {
+        my ($domain) = basename($path) =~ /^nginx-(.+)\.conf$/;
+        next unless $domain && valid_domain($domain);
 
-    compose_include_remove "$alias"
-    webserver_deps_volumes_remove "$alias" "redirect-${service}"
+        my $e = parse_nginx_conf($path, $domain) or next;
+        push @reuse, $domain if delete $e->{_reuseport};
 
-    rm -f "${DOMAINS_YML_DIR}/${alias}.yml" "${NGINX_CONF_DIR}/nginx-${alias}.conf"
+        if (reg_load_one($domain)) { say_info "$domain — уже в реєстрі, пропущено"; next }
 
-    nginx_test_and_reload
+        my $yml = parse_domain_yml("$src/docker-compose.domains/$domain.yml");
+        if ($e->{type} eq 'wordpress') {
+            $e->{image}    = $yml->{image}    if $yml->{image};
+            $e->{db_image} = $yml->{db_image} if $yml->{db_image} && $yml->{db_image} ne $CFG{db_image};
+            $e->{db_name}  = $yml->{db_name}  || db_name_of($domain);
+            $e->{db_user}  = $yml->{db_user}  || db_user_of($domain);
+            # Успадкований пароль узято з працюючої БД, а не виведено з
+            # ключа. Позначаємо як random, інакше `secrets restore` колись
+            # підсуне БД пароль, якого вона не знає.
+            $e->{password_mode} = 'random';
 
-    if confirm "Прибрати також файли в ${SITES_ROOT}/${alias}?"; then
-        sudo rm -rf "${SITES_ROOT:?}/${alias:?}"
-    fi
+            if ($yml->{password}) {
+                unless (-f secret_path($domain)) {
+                    make_path("$ROOT/secrets") unless -d "$ROOT/secrets";
+                    chmod 0700, "$ROOT/secrets";
+                    write_file(secret_path($domain), secret_body($domain, $yml->{password}),
+                               force => 1, mode => 0600, quiet => 1);
+                    say_ok "secrets/$domain.env — пароль перенесено з наявного yml (той самий, БД не чіпаємо)";
+                }
+            } else {
+                push @notes, "$domain: не знайшов MYSQL_PASSWORD у docker-compose.domains/$domain.yml "
+                           . '— пароль доведеться вписати в secrets/ вручну';
+            }
+            for my $k (qw(db_name db_user)) {
+                my $derived = $k eq 'db_name' ? db_name_of($domain) : db_user_of($domain);
+                push @notes, "$domain: $k='$e->{$k}' не збігається зі схемою іменування ('$derived') "
+                           . '— лишено як є, БД перейменовувати не треба'
+                    if $e->{$k} ne $derived;
+            }
+            my $expect = 'wordpress-' . sid_of($domain);
+            push @notes, "$domain: nginx шле PHP на '$e->{php_service}', а не на '$expect' "
+                       . '— перевірте, чи це не copy-paste на чужий сайт'
+                if ($e->{php_service} // '') ne $expect;
+        }
+        push @notes, "$domain: тип redirect, але не знайшов домену призначення "
+                   . '— впишіть target у domains/' . $domain . '.conf'
+            if $e->{type} eq 'redirect' && !$e->{target};
 
-    log "Redirect-сайт ${alias} видалено."
+        reg_save($e);
+        say_ok "domains/$domain.conf — $e->{type}"
+             . ($e->{target} ? " -> $e->{target}" : '')
+             . ($e->{upstream} ? " -> $e->{upstream}" : '');
+        $n++;
+    }
+
+    say_step "Імпортовано доменів: $n";
+    if (@reuse) {
+        say_info "reuseport на 443 стоїть у: @reuse";
+        if (@reuse == 1 && lc($CFG{quic_reuseport_domain} // '') ne lc $reuse[0]) {
+            say_warn "впишіть у dcp.conf:  quic_reuseport_domain = $reuse[0]";
+        } elsif (@reuse > 1) {
+            say_warn 'reuseport більш ніж в одному vhost — nginx впаде з "duplicate listen options"';
+        }
+    }
+    say_warn $_ for @notes;
+    print <<'TXT';
+
+Нічого не змінено, крім реєстру domains/ і secrets/. Далі, не поспішаючи:
+  dcpmgmt doctor          — звірити реєстр із тим, що реально на диску
+  dcpmgmt render --diff   — побачити, чим згенероване відрізняється від наявного
+  dcpmgmt apply           — застосувати (перед цим покаже, які контейнери смикне)
+TXT
 }
 
-cmd_add_proxy_site() {
-    local domain="$1" upstream="$2"
-    local service; service="$(service_id "$domain")"
+# ─────────────────────────── doctor ───────────────────────────
 
-    require_root_dir
-    [[ -f "${DOMAINS_YML_DIR}/${domain}.yml" ]] && die "${domain}.yml вже існує."
+sub cmd_secrets {
+    my @args = @_;
+    my $sub  = shift @args // '';
+    load_config();
 
-    log "=== add-proxy-site: ${domain} -> ${upstream} (service=${service}) ==="
-
-    ensure_webroot_dir "$domain"
-
-    write_nginx_bootstrap_conf "$domain"
-    docker exec webserver nginx -t
-    docker exec webserver nginx -s reload
-
-    issue_cert_bootstrap "$domain"
-
-    write_nginx_proxy_conf "$domain" "$upstream"
-    write_compose_proxy_yml "$domain" "$service"
-
-    compose_include_add "$domain"
-    webserver_deps_volumes_add "$domain" "" "0"
-
-    docker compose up -d "certbot-${service}"
-
-    nginx_test_and_reload
-
-    warn "Заготовку ${DOMAINS_YML_DIR}/${domain}.yml дозаповніть service-блоком застосунку"
-    warn "(image/volumes/environment), networks: [app-network], та підніміть його:"
-    warn "  docker compose up -d <ваш-сервіс>"
-    log "nginx вже проксіює https://${domain}/ -> http://${upstream}/"
+    if ($sub eq 'show') {
+        my $d = shift @args or die_err 'потрібен домен: dcpmgmt secrets show <domain>';
+        my $e = reg_load_one($d) or die_err "домену $d немає в реєстрі";
+        my %env = read_kv(secret_path($d));
+        if ($env{mysql_password}) {
+            print "$env{mysql_password}\n";
+        }
+        elsif (($e->{password_mode} // $CFG{password_mode}) eq 'derived') {
+            say_warn "secrets/$d.env немає — показую виведений із ключа";
+            print derived_password($d), "\n";
+        }
+        else {
+            die_err "secrets/$d.env немає, а пароль домену випадковий — відновити нізвідки";
+        }
+    }
+    elsif ($sub eq 'restore') {
+        my ($created, @lost) = (0);
+        for my $e (reg_all()) {
+            next unless $e->{type} eq 'wordpress';
+            my $d = $e->{domain};
+            next if -f secret_path($d);
+            if (($e->{password_mode} // $CFG{password_mode}) ne 'derived') {
+                push @lost, $d;
+                next;
+            }
+            make_path("$ROOT/secrets") unless -d "$ROOT/secrets";
+            chmod 0700, "$ROOT/secrets";
+            write_file(secret_path($d), secret_body($d, derived_password($d), 'derived'),
+                       force => 1, mode => 0600, quiet => 1);
+            say_ok "secrets/$d.env — відновлено з ключа";
+            $created++;
+        }
+        say_ok "відновлено файлів: $created";
+        if (@lost) {
+            say_warn 'пароль випадковий, з ключа не виводиться: ' . join(', ', @lost);
+            say_warn 'для цих доменів пароль доведеться змінити в самій БД:';
+            say_warn "  docker exec -it db-<sid> mariadb -uroot -p  →  ALTER USER ... IDENTIFIED BY ...";
+        }
+    }
+    elsif ($sub eq 'key') {
+        my $path = master_key_path();
+        master_key();                       # створить, якщо його ще немає
+        printf "%s (%s)\n", $path, -f $path ? sprintf('%04o', (stat $path)[2] & 07777) : 'немає';
+    }
+    else {
+        die_err 'dcpmgmt secrets show <domain> | restore | key';
+    }
 }
 
-cmd_del_proxy_site() {
-    local domain="$1"
-    local service; service="$(service_id "$domain")"
-    require_root_dir
-    [[ -f "${DOMAINS_YML_DIR}/${domain}.yml" ]] || die "${domain}.yml не знайдено."
+sub cmd_doctor {
+    load_config();
+    my @doms = reg_all();
+    my ($errs, $warns) = (0, 0);
+    my $bad  = sub { $errs++;  say_err @_ };
+    my $soft = sub { $warns++; say_warn @_ };
 
-    confirm "Видалити проксі-сайт ${domain}? (сервіс застосунку, якщо є, доведеться зупинити вручну)" \
-        || { log "Скасовано."; return; }
+    say_step 'Конфігурація';
+    say_ok "проєкт compose: $CFG{project} (префікс імен volume'ів: ${\ $CFG{project}}_)";
+    if (have_docker()) {
+        my $out = capture('docker', 'ps', '-a', '--filter', 'name=^webserver$',
+                          '--format', '{{.Label "com.docker.compose.project"}}');
+        chomp $out;
+        $bad->("контейнер webserver належить проєкту '$out', а dcp.conf каже '$CFG{project}'.\n"
+             . "       Із таким розходженням compose створить НОВІ порожні volume'и замість наявних.\n"
+             . "       Виправте project у dcp.conf на '$out'.")
+            if $out && $out ne $CFG{project};
+    }
 
-    docker compose stop "certbot-${service}" 2>/dev/null || true
-    docker compose rm -f "certbot-${service}" 2>/dev/null || true
-    docker volume rm "docker-compose-project_proxywebroot-${service}" 2>/dev/null || true
+    say_step 'Домени';
+    my %php_seen;
+    for my $e (@doms) {
+        my $d = $e->{domain};
+        my @p;
+        push @p, 'немає nginx-конфіга'         unless -f nginx_conf_path($d);
+        push @p, "немає каталогу $CFG{sites_root}/$d/web" unless -d "$CFG{sites_root}/$d/web";
+        push @p, 'немає сертифіката'           unless cert_live($d);
+        if ($e->{type} eq 'wordpress') {
+            push @p, "немає каталогу БД $CFG{sites_root}/$d/db" unless -d "$CFG{sites_root}/$d/db";
+            push @p, 'немає secrets/' . "$d.env" unless -f secret_path($d);
+            push @p, 'порожній web/ — WordPress не розгорнувся'
+                if -d "$CFG{sites_root}/$d/web" && !-e "$CFG{sites_root}/$d/web/index.php";
+            if (my $mode = (stat secret_path($d))[2]) {
+                $soft->("secrets/$d.env має права " . sprintf('%04o', $mode & 07777) . ', очікується 0600')
+                    if ($mode & 07777) != 0600;
+            }
+            my $php = $e->{php_service} // '';
+            $soft->("$d: PHP іде на '$php', який уже обслуговує $php_seen{$php} — copy-paste на чужий сайт?")
+                if $php && $php_seen{$php};
+            $php_seen{$php} = $d if $php;
+        }
+        push @p, 'тип redirect без target'     if $e->{type} eq 'redirect' && !$e->{target};
+        $soft->("$d: docker-compose.domains/$d.yml ще з CHANGE-ME — опишіть сервіс "
+              . 'застосунку, інакше домен лишається поза стеком')
+            if $e->{type} eq 'proxy' && -f domain_yml_path($d) && !domain_yml_ready($d);
 
-    compose_include_remove "$domain"
-    webserver_deps_volumes_remove "$domain" ""
+        if (@p) { $bad->("$d: $_") for @p }
+        else    { printf "  %s %-34s %s\n", c('1;32', '  ok  '), $d, cert_expiry($d) // '' }
+    }
 
-    rm -f "${DOMAINS_YML_DIR}/${domain}.yml" "${NGINX_CONF_DIR}/nginx-${domain}.conf"
+    say_step 'Подовження сертифікатів';
+    # Спільний certbot виконує `certbot renew` для всіх сертифікатів одразу,
+    # а шлях до webroot кожен сертифікат пам'ятає у своєму renewal-конфізі,
+    # записаному при первинній видачі. Якщо шлях не збігається з тим, що ми
+    # монтуємо, подовження тихо провалиться — і виявиться це за 90 днів.
+    for my $e (@doms) {
+        my $d  = $e->{domain};
+        my $rc = "$CFG{letsencrypt_dir}/etc/renewal/$d.conf";
+        unless (-e $rc) {
+            $soft->("$d: немає $rc — сертифікат не подовжуватиметься автоматично")
+                if cert_live($d);
+            next;
+        }
+        my $c = slurp($rc) // next;
+        my ($auth) = $c =~ /^authenticator\s*=\s*(\S+)/m;
+        $soft->("$d: authenticator=$auth, а не webroot — подовження піде іншим шляхом, "
+              . 'перевірте вручну')
+            if $auth && $auth ne 'webroot';
+        my @paths = $c =~ /^webroot_path\s*=\s*(.+)$/m ? split(/\s*,\s*/, $1) : ();
+        push @paths, ($c =~ /^\Q$d\E\s*=\s*(\S+)/m ? $1 : ());
+        my $want = "/var/www/html/$d";
+        next unless @paths;
+        unless (grep { $_ eq $want } @paths) {
+            $bad->("$d: у renewal-конфізі webroot_path='" . join(',', @paths) . "', "
+                 . "а спільний certbot монтує webroot як '$want'.\n"
+                 . "       Подовження провалиться. Полагодити одноразово:\n"
+                 . "       sed -i 's,$paths[0],$want,g' $rc");
+        }
+    }
 
-    nginx_test_and_reload
+    say_step 'nginx';
+    my @reuse = grep { (nginx_uncommented($_) // '') =~ /reuseport/ } glob("$ROOT/nginx/nginx-*.conf");
+    if (@reuse > 1) {
+        $bad->('reuseport на 443 більш ніж в одному vhost — nginx впаде з "duplicate listen options": '
+             . join(', ', map { basename($_) } @reuse));
+    } elsif (!@reuse && grep { $_->{http3} eq 'on' } @doms) {
+        $soft->('жоден vhost не має reuseport на 443 — HTTP/3 працюватиме, але без розподілу '
+              . 'QUIC-з\'єднань між воркерами (dcp.conf: quic_reuseport_domain)');
+    }
 
-    log "Проксі-сайт ${domain} видалено (nginx-частина). Сервіс застосунку перевірте окремо."
+    say_step 'Паролі';
+    my $key_path = master_key_path();
+    if (-f $key_path) {
+        my $key_mode = sprintf('%04o', (stat $key_path)[2] & 07777);
+        $soft->("майстер-ключ $key_path має права $key_mode, очікується 0400")
+            if $key_mode ne '0400';
+        say_ok "майстер-ключ $key_path ($key_mode)";
+    } else {
+        say_ok "майстер-ключа ще немає — з'явиться при першому derived-паролі";
+    }
+    for my $e (@doms) {
+        next unless $e->{type} eq 'wordpress';
+        next unless ($e->{password_mode} // $CFG{password_mode}) eq 'derived';
+        my $d = $e->{domain};
+        next unless -f secret_path($d) && -f $key_path;
+        my %env = read_kv(secret_path($d));
+        next unless $env{mysql_password};
+        # Розходження означає або підмінений майстер-ключ, або ручну зміну
+        # пароля. Друге законно, перше зробить `secrets restore` шкідливим.
+        $soft->("$d: пароль у secrets/ не збігається з виведеним із ключа. "
+              . 'Змінювали вручну — гаразд; якщо ні, ключ не той, і '
+              . '`secrets restore` підсуне БД чужий пароль')
+            if $env{mysql_password} ne derived_password($d);
+    }
+
+    say_step 'QUIC';
+    if (quic_bpf_enabled()) {
+        $bad->('quic_bpf = on, але nginx/nginx.conf не згенеровано — директива '
+             . 'головного контексту нікуди не потрапила. Виконайте: dcpmgmt render')
+            unless -f main_nginx_conf_path();
+        $soft->('quic_bpf = on при worker_processes = 1 нічого не дає: воркер один, '
+              . 'розподіляти QUIC-пакети між ними нема потреби')
+            if $CFG{worker_processes} eq '1';
+        $soft->('quic_bpf = on, але жоден vhost не має reuseport — без нього eBPF-'
+              . 'маршрутизація не застосовується (dcp.conf: quic_reuseport_domain)')
+            unless $CFG{quic_reuseport_domain};
+    }
+    elsif (-f main_nginx_conf_path() && (nginx_uncommented(main_nginx_conf_path()) // '') =~ /quic_bpf\s+on/) {
+        $soft->('nginx/nginx.conf вмикає quic_bpf, а dcp.conf каже off — привілеї '
+              . 'для bpf() у compose не додаються, nginx може не стартувати');
+    }
+
+    say_step 'Файли без пари';
+    my %known = map { $_->{domain} => 1 } @doms;
+    for my $f (glob("$ROOT/nginx/nginx-*.conf")) {
+        my ($d) = basename($f) =~ /^nginx-(.+)\.conf$/;
+        next unless $d && !$known{$d};
+        if (valid_domain($d)) {
+            $soft->("nginx/nginx-$d.conf є, а домену $d немає в реєстрі (dcpmgmt import?)");
+        } else {
+            $soft->("nginx/nginx-$d.conf — не конфіг домену, нікуди не монтується і "
+                  . 'ніколи не діяв: conf.d інклюдиться всередині http{}, а директиви '
+                  . 'головного контексту там не дозволені. Якщо це був quic_bpf — '
+                  . 'вмикайте його через dcp.conf (quic_bpf = on), а файл видаліть');
+        }
+    }
+    for my $f (glob("$ROOT/docker-compose.domains/*.yml")) {
+        my $d = basename($f, '.yml');
+        $soft->("docker-compose.domains/$d.yml є, а домену $d немає в реєстрі") unless $known{$d};
+    }
+
+    if (have_docker()) {
+        say_step 'docker compose config';
+        chdir $ROOT;
+        if (run('docker', 'compose', 'config', '-q')) { say_ok 'конфігурація коректна' }
+        else { $bad->('docker compose config не проходить — стек у такому стані не підніметься') }
+    }
+
+    print "\n";
+    if ($errs) { say_warn c('1;31', "помилок: $errs, попереджень: $warns"); exit 1 }
+    say_ok "помилок немає" . ($warns ? ", попереджень: $warns" : '');
 }
 
-# ───────────────────────── main ─────────────────────────
+# ─────────────────────────── main ───────────────────────────
 
-usage() {
-    cat <<EOF
-dcpmgmt — керування доменами в docker-compose проєкті
+sub usage {
+    print <<'TXT';
+dcpmgmt — керування доменами docker web-стека (nginx + WordPress/redirect/proxy)
 
-  dcpmgmt add-site <domain> [image]
-  dcpmgmt del-site <domain>
-  dcpmgmt add-redirect-site <alias> <target-domain>
-  dcpmgmt del-redirect-site <alias>
-  dcpmgmt add-proxy-site <domain> <upstream-host:port>
-  dcpmgmt del-proxy-site <domain>
-EOF
+  dcpmgmt init                          створити структуру проєкту з нуля
+  dcpmgmt import [--from DIR]           зібрати реєстр із наявної інсталяції
+
+  dcpmgmt add wordpress <domain> [--image IMG] [--no-http3] [--no-cert]
+  dcpmgmt add redirect  <domain> --to <target> [--no-cert]
+  dcpmgmt add proxy     <domain> --upstream <host:port> [--no-cert]
+  dcpmgmt remove <domain> [--purge]     --purge = разом із даними й сертифікатом
+
+  dcpmgmt list [--type T] [--names]     що є в реєстрі (--names: для скриптів)
+  dcpmgmt doctor                        перевірити узгодженість усього
+  dcpmgmt render [--diff] [--force] [<domain>...]   перегенерувати файли
+  dcpmgmt apply [--force]               застосувати до працюючого стека
+  dcpmgmt cert issue|renew|list [<domain>] [--staging] [--force]
+  dcpmgmt secrets show <domain> | restore | key
+
+Глобальні ключі:  --yes (не питати підтверджень)
+
+Джерело істини — domains/*.conf і dcp.conf; усе інше генерується.
+Подробиці: README.md
+TXT
 }
 
-main() {
-    local cmd="${1:-}"; shift || true
-    case "$cmd" in
-        add-site)            [[ $# -ge 1 ]] || { usage; die "потрібен <domain>"; }; cmd_add_site "$@" ;;
-        del-site)             [[ $# -ge 1 ]] || { usage; die "потрібен <domain>"; }; cmd_del_site "$@" ;;
-        add-redirect-site)    [[ $# -ge 2 ]] || { usage; die "потрібні <alias> <target-domain>"; }; cmd_add_redirect_site "$@" ;;
-        del-redirect-site)    [[ $# -ge 1 ]] || { usage; die "потрібен <alias>"; }; cmd_del_redirect_site "$@" ;;
-        add-proxy-site)       [[ $# -ge 2 ]] || { usage; die "потрібні <domain> <upstream-host:port>"; }; cmd_add_proxy_site "$@" ;;
-        del-proxy-site)       [[ $# -ge 1 ]] || { usage; die "потрібен <domain>"; }; cmd_del_proxy_site "$@" ;;
-        *) usage; exit 1 ;;
-    esac
+sub main {
+    my @args = @_;
+    @args = grep { $_ ne '--yes' or !($YES = 1) } @args;
+    my $cmd = shift(@args) // '';
+
+    if    ($cmd eq 'init')    { cmd_init(@args) }
+    elsif ($cmd eq 'import')  { cmd_import(@args) }
+    elsif ($cmd eq 'add')     { cmd_add(@args) }
+    elsif ($cmd eq 'remove'
+        || $cmd eq 'rm')      { cmd_remove(@args) }
+    elsif ($cmd eq 'list'
+        || $cmd eq 'ls')      { cmd_list(@args) }
+    elsif ($cmd eq 'render')  { cmd_render(@args) }
+    elsif ($cmd eq 'apply')   { cmd_apply(@args) }
+    elsif ($cmd eq 'cert')    { cmd_cert(@args) }
+    elsif ($cmd eq 'secrets') { cmd_secrets(@args) }
+    elsif ($cmd eq 'doctor')  { cmd_doctor(@args) }
+    elsif ($cmd eq 'version') { print "dcpmgmt $VERSION\n" }
+    elsif ($cmd eq 'help' || $cmd eq '--help' || $cmd eq '-h' || $cmd eq '') { usage() }
+    else { usage(); die_err "невідома команда '$cmd'" }
 }
 
-main "$@"
+main(@ARGV);
