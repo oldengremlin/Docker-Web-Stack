@@ -1,0 +1,741 @@
+#!/usr/bin/env bash
+#
+# dcpmgmt — керування доменами в мультидоменному docker-compose проєкті
+# (nginx + per-домен WordPress/redirect/proxy контейнери).
+#
+# Запускати з кореня проєкту (~/src/docker-compose-project), під користувачем
+# з правами sudo/docker.
+#
+# Команди:
+#   dcpmgmt add-site <domain> [image]
+#   dcpmgmt del-site <domain>
+#   dcpmgmt add-redirect-site <alias> <target-domain>
+#   dcpmgmt del-redirect-site <alias>
+#   dcpmgmt add-proxy-site <domain> <upstream-host:port>
+#   dcpmgmt del-proxy-site <domain>
+#
+# ПЕРЕД ПЕРШИМ ВИКОРИСТАННЯМ:
+#   - перевірте змінні в розділі "Налаштування" нижче (шляхи, email для certbot);
+#   - зробіть git commit / бекап поточного стану проєкту;
+#   - протестуйте на не-критичному домені перед тим, як довіряти скрипту прод.
+#
+# Скрипт НЕ ідеальний і не претендує на промислову якість "з коробки" —
+# це робоча перша версія, призначена для подальшого ітеративного гартування
+# (рекомендовано — Claude Code, з git-репозиторієм і реальним тестуванням).
+
+set -euo pipefail
+
+# ───────────────────────── Налаштування ─────────────────────────
+
+PROJECT_DIR="$(pwd)"
+SITES_ROOT="/var/sites"
+NGINX_CONF_DIR="${PROJECT_DIR}/nginx"
+DOMAINS_YML_DIR="${PROJECT_DIR}/docker-compose.domains"
+COMPOSE_MAIN="${PROJECT_DIR}/docker-compose.main.yml"
+COMPOSE_ROOT="${PROJECT_DIR}/docker-compose.yml"
+CERTBOT_EMAIL="oldengremlin@gmail.com"
+DEFAULT_WP_IMAGE="wordpress:6.8.3-php8.4-fpm"
+DEFAULT_DB_IMAGE="mariadb:latest"
+
+# ───────────────────────── Допоміжні функції ─────────────────────────
+
+log()  { echo -e "\033[1;34m[dcpmgmt]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[dcpmgmt WARN]\033[0m $*" >&2; }
+die()  { echo -e "\033[1;31m[dcpmgmt ERROR]\033[0m $*" >&2; exit 1; }
+
+require_root_dir() {
+    [[ -f "$COMPOSE_ROOT" && -f "$COMPOSE_MAIN" ]] \
+        || die "Не знайдено docker-compose.yml/docker-compose.main.yml у $(pwd). Запускайте з кореня проєкту."
+}
+
+# service_id: домен без крапок/дефісів, у нижньому регістрі — так само,
+# як у всьому проєкті (vvv.soft-dental.kiev.ua -> vvvsoft-dentalkievua)
+service_id() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '.-'
+}
+
+# db-юзер: 'u' + service_id, обрізаний до 32 символів (ліміт MySQL/MariaDB)
+db_user_for() {
+    local sid
+    sid="$(service_id "$1")"
+    local u="u${sid}"
+    if [[ ${#u} -gt 32 ]]; then
+        u="${u:0:24}$(echo -n "$1" | md5sum | cut -c1-8)"
+    fi
+    echo "$u"
+}
+
+random_password() {
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40
+}
+
+confirm() {
+    local prompt="$1"
+    read -r -p "$prompt [так/ні]: " ans
+    [[ "$ans" == "так" || "$ans" == "yes" || "$ans" == "y" ]]
+}
+
+nginx_test_and_reload() {
+    log "nginx -t ..."
+    docker exec webserver nginx -t
+    log "nginx -s reload ..."
+    docker exec webserver nginx -s reload
+}
+
+ensure_webroot_dir() {
+    local domain="$1"
+    mkdir -p "${SITES_ROOT}/${domain}/web"
+}
+
+# Додає домен в top-level include: docker-compose.yml (якщо ще не додано)
+compose_include_add() {
+    local domain="$1"
+    local line="  - docker-compose.domains/${domain}.yml"
+    grep -qxF "$line" "$COMPOSE_ROOT" && { log "include вже містить ${domain}.yml"; return; }
+    # вставляємо одразу після рядка "include:"
+    sed -i "/^include:$/a ${line}" "$COMPOSE_ROOT"
+    log "Додано в docker-compose.yml: ${line}"
+}
+
+compose_include_remove() {
+    local domain="$1"
+    local line="  - docker-compose.domains/${domain}.yml"
+    sed -i "\#^${line}\$#d" "$COMPOSE_ROOT"
+    log "Прибрано з docker-compose.yml: ${line}"
+}
+
+# Додає сервіс у depends_on: та volume+конфіг у volumes: секцію webserver
+# у docker-compose.main.yml. Працює текстовими вставками "перед першим
+# рядком, що починається з певного маркера" — крихко до ручних правок
+# структури файлу, але передбачувано для типового випадку.
+webserver_deps_volumes_add() {
+    local domain="$1" service="$2" is_wp_or_redirect="$3"  # "1" якщо потрібен volume /var/www/html/<domain>, інакше "0"
+
+    # depends_on: вставити перед рядком "    volumes:"
+    if ! grep -q "^      - ${service}\$" "$COMPOSE_MAIN"; then
+        sed -i "0,/^    volumes:\$/s//      - ${service}\n    volumes:/" "$COMPOSE_MAIN"
+        log "webserver depends_on += ${service}"
+    fi
+
+    if [[ "$is_wp_or_redirect" == "1" ]]; then
+        # volumes: вставити перед рядком "    environment:"
+        local vol_lines="      - ${service}:/var/www/html/${domain}\n      - ./nginx/nginx-${domain}.conf:/etc/nginx/conf.d/${domain}.conf:ro"
+        if ! grep -q "^      - ${service}:/var/www/html/${domain}\$" "$COMPOSE_MAIN"; then
+            sed -i "0,/^    environment:\$/s#^    environment:\$#${vol_lines}\n    environment:#" "$COMPOSE_MAIN"
+            log "webserver volumes += ${service} webroot + nginx conf"
+        fi
+    else
+        # проксі-сайт: тільки конфіг nginx, без /var/www/html volume
+        local vol_line="      - ./nginx/nginx-${domain}.conf:/etc/nginx/conf.d/${domain}.conf:ro"
+        if ! grep -qxF "$vol_line" "$COMPOSE_MAIN"; then
+            sed -i "0,/^    environment:\$/s#^    environment:\$#${vol_line}\n    environment:#" "$COMPOSE_MAIN"
+            log "webserver volumes += nginx conf (proxy-сайт)"
+        fi
+    fi
+}
+
+webserver_deps_volumes_remove() {
+    local domain="$1" service="$2"
+    sed -i "\#^      - ${service}\$#d" "$COMPOSE_MAIN"
+    sed -i "\#^      - ${service}:/var/www/html/${domain}\$#d" "$COMPOSE_MAIN"
+    sed -i "\#^      - \./nginx/nginx-${domain}\.conf:/etc/nginx/conf.d/${domain}\.conf:ro\$#d" "$COMPOSE_MAIN"
+    log "webserver depends_on/volumes: прибрано записи для ${domain}"
+}
+
+# ───────────────────────── Шаблони nginx ─────────────────────────
+
+# :80-заглушка на час первинного отримання сертифіката (без :443-блоку,
+# бо ssl_certificate ще фізично не існує — інакше nginx -t впаде)
+write_nginx_bootstrap_conf() {
+    local domain="$1"
+    cat > "${NGINX_CONF_DIR}/nginx-${domain}.conf" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+    location ~ /.well-known/acme-challenge {
+        allow all;
+        root /var/www/html/${domain};
+    }
+    location / {
+        return 200 'provisioning';
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+}
+
+write_nginx_wp_conf() {
+    local domain="$1" service="$2"
+    cat > "${NGINX_CONF_DIR}/nginx-${domain}.conf" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+    location ~ /ads.txt {
+        allow all;
+        root /var/www/html/${domain};
+    }
+    location ~ /.well-known/acme-challenge {
+        allow all;
+        root /var/www/html/${domain};
+    }
+    location / {
+        return 302 https://${domain}\$request_uri;
+    }
+}
+server {
+    listen 443 quic;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    http3 on;
+    quic_gso on;
+    quic_retry on;
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/x-javascript text/xml application/xml application/rss+xml text/javascript image/x-icon image/bmp image/svg+xml;
+    gzip_vary on;
+    gzip_comp_level 1;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    add_header Alt-Svc 'h3=":443"; h3-29=":443"; ma=86400';
+
+    server_name ${domain};
+
+    index index.php index.html index.htm;
+
+    root /var/www/html/${domain};
+
+    server_tokens off;
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/${domain}/chain.pem;
+
+    location / {
+            try_files \$uri \$uri/ /index.php\$is_args\$args;
+    }
+
+    location ~ \.php\$ {
+            try_files \$uri =404;
+            fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+            fastcgi_pass ${service}:9000;
+            fastcgi_index index.php;
+            include fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+            fastcgi_param PATH_INFO \$fastcgi_path_info;
+
+            fastcgi_buffer_size 64k;
+            fastcgi_buffers 16 32k;
+    }
+
+    location ~ /\.ht {
+            deny all;
+    }
+
+    location = /favicon.ico {
+            log_not_found off; access_log off;
+    }
+    location = /robots.txt {
+            log_not_found off; access_log off; allow all;
+    }
+    location ~* \.(css|gif|ico|jpeg|jpg|js|png)\$ {
+            expires max;
+            log_not_found off;
+    }
+}
+EOF
+}
+
+write_nginx_redirect_conf() {
+    local alias="$1" target="$2"
+    cat > "${NGINX_CONF_DIR}/nginx-${alias}.conf" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${alias};
+    location ~ /.well-known/acme-challenge {
+        allow all;
+        root /var/www/html/${alias};
+    }
+    location / {
+        return 302 https://${target}\$request_uri;
+    }
+}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${alias};
+
+    index index.html index.htm;
+
+    root /var/www/html/${alias};
+
+    server_tokens off;
+    ssl_certificate /etc/letsencrypt/live/${alias}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${alias}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/${alias}/chain.pem;
+
+    location / {
+            try_files \$uri \$uri/ /index.php\$is_args\$args;
+    }
+
+    location ~ /\.ht {
+            deny all;
+    }
+
+    location = /favicon.ico {
+            log_not_found off; access_log off;
+    }
+    location = /robots.txt {
+            log_not_found off; access_log off; allow all;
+    }
+    location ~* \.(css|gif|ico|jpeg|jpg|js|png)\$ {
+            expires max;
+            log_not_found off;
+    }
+}
+EOF
+}
+
+write_redirect_index_html() {
+    local alias="$1" target="$2"
+    cat > "${SITES_ROOT}/${alias}/web/index.html" <<EOF
+<!DOCTYPE HTML>
+<html lang="en-US">
+    <head>
+        <meta charset="UTF-8">
+        <meta http-equiv="refresh" content="0; url=https://${target}">
+        <script type="text/javascript">
+            window.location.href = "https://${target}"
+        </script>
+        <title>Page Redirection</title>
+    </head>
+    <body>
+        If you are not redirected automatically, follow this <a href='https://${target}'>link to example</a>.
+    </body>
+</html>
+EOF
+}
+
+write_nginx_proxy_conf() {
+    local domain="$1" upstream="$2"
+    cat > "${NGINX_CONF_DIR}/nginx-${domain}.conf" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+    location ~ /.well-known/acme-challenge {
+        allow all;
+        root /var/www/html/${domain};
+        try_files \$uri =404;
+    }
+    location / {
+        return 302 https://${domain}\$request_uri;
+    }
+}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${domain};
+
+    server_tokens off;
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/${domain}/chain.pem;
+
+    location / {
+        proxy_pass http://${upstream}/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 90s;
+        proxy_connect_timeout 90s;
+        proxy_send_timeout 90s;
+    }
+}
+EOF
+}
+
+# ───────────────────────── Шаблони docker-compose.domains ─────────────────────────
+
+write_compose_wp_yml() {
+    local domain="$1" service="$2" image="$3"
+    local dbuser dbpass
+    dbuser="$(db_user_for "$domain")"
+    dbpass="$(random_password)"
+    cat > "${DOMAINS_YML_DIR}/${domain}.yml" <<EOF
+services:
+  wordpress-${service}:
+    image: ${image}
+    restart: unless-stopped
+    container_name: wordpress-${service}
+    environment:
+      WORDPRESS_DB_HOST: db-${service}
+      WORDPRESS_DB_USER: ${dbuser}
+      WORDPRESS_DB_PASSWORD: ${dbpass}
+      WORDPRESS_DB_NAME: ${service}
+    volumes:
+      - wordpress-${service}:/var/www/html/${domain}
+    depends_on:
+      - db-${service}
+    networks:
+      - app-network
+
+  db-${service}:
+    image: ${DEFAULT_DB_IMAGE}
+    restart: unless-stopped
+    container_name: db-${service}
+    command:
+      - '--skip-log-bin'
+    environment:
+      MYSQL_DATABASE: ${service}
+      MYSQL_USER: ${dbuser}
+      MYSQL_PASSWORD: ${dbpass}
+      MYSQL_RANDOM_ROOT_PASSWORD: '1'
+    cap_add:
+      - CAP_SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - db-${service}:/var/lib/mysql
+    networks:
+      - app-network
+    healthcheck:
+      timeout: 20s
+      retries: 10
+      test: [ "CMD", "mariadb-admin", "ping", "-hlocalhost", "-u${dbuser}", "-p${dbpass}" ]
+
+  certbot-${service}:
+    image: certbot/certbot
+    container_name: certbot-${service}
+    depends_on:
+      - webserver
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - wordpress-${service}:/var/www/html/${domain}
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --cert-name ${domain}; sleep 12h & wait \$\${!}; done;'"
+
+volumes:
+  wordpress-${service}:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SITES_ROOT}/${domain}/web
+  db-${service}:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SITES_ROOT}/${domain}/db
+EOF
+    log "Створено ${DOMAINS_YML_DIR}/${domain}.yml (db_user=${dbuser})"
+}
+
+write_compose_redirect_yml() {
+    local alias="$1" service="$2"
+    cat > "${DOMAINS_YML_DIR}/${alias}.yml" <<EOF
+services:
+  redirect-${service}:
+    container_name: redirect-${service}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - trap exit TERM; while :; do sleep 24h & wait \$\${!}; done;
+    image: alpine:latest
+    networks:
+      - app-network
+    restart: unless-stopped
+    volumes:
+      - redirect-${service}:/var/www/html/${alias}
+
+  certbot-${service}:
+    image: certbot/certbot
+    container_name: certbot-${service}
+    depends_on:
+      - webserver
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - redirect-${service}:/var/www/html/${alias}
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --cert-name ${alias}; sleep 12h & wait \$\${!}; done;'"
+
+volumes:
+  redirect-${service}:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SITES_ROOT}/${alias}/web
+EOF
+    log "Створено ${DOMAINS_YML_DIR}/${alias}.yml"
+}
+
+write_compose_proxy_yml() {
+    local domain="$1" service="$2"
+    cat > "${DOMAINS_YML_DIR}/${domain}.yml" <<EOF
+# Основа для проксі-сайту ${domain}. Сервіс застосунку (upstream) — не тут,
+# додайте власний service-блок нижче вручну (image/volumes/оточення застосунку).
+# Не забудьте networks: [app-network] і назву, що збігається з upstream
+# в nginx/nginx-${domain}.conf (proxy_pass).
+
+services:
+  certbot-${service}:
+    image: certbot/certbot
+    container_name: certbot-${service}
+    depends_on:
+      - webserver
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - proxywebroot-${service}:/var/www/html/${domain}
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --cert-name ${domain}; sleep 12h & wait \$\${!}; done;'"
+
+volumes:
+  proxywebroot-${service}:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SITES_ROOT}/${domain}/web
+EOF
+    log "Створено ${DOMAINS_YML_DIR}/${domain}.yml (заготовка — дозаповніть service застосунку вручну)"
+}
+
+# ───────────────────────── Отримання сертифіката (bootstrap) ─────────────────────────
+
+issue_cert_bootstrap() {
+    local domain="$1"
+    log "Первинне отримання сертифіката для ${domain} (webroot: ${SITES_ROOT}/${domain}/web) ..."
+    docker run --rm \
+        -v docker-compose-project_certbot-etc:/etc/letsencrypt \
+        -v docker-compose-project_certbot-var:/var/lib/letsencrypt \
+        -v "${SITES_ROOT}/${domain}/web:/var/www/html/${domain}" \
+        certbot/certbot certonly --webroot \
+            --email "${CERTBOT_EMAIL}" --agree-tos --no-eff-email \
+            --webroot-path="/var/www/html/${domain}" \
+            -d "${domain}" --non-interactive
+    log "Сертифікат для ${domain} отримано."
+}
+
+# ───────────────────────── Команди ─────────────────────────
+
+cmd_add_site() {
+    local domain="$1" image="${2:-$DEFAULT_WP_IMAGE}"
+    local service; service="$(service_id "$domain")"
+
+    require_root_dir
+    [[ -f "${DOMAINS_YML_DIR}/${domain}.yml" ]] && die "${domain}.yml вже існує — домен вже доданий?"
+
+    log "=== add-site: ${domain} (service=${service}, image=${image}) ==="
+
+    ensure_webroot_dir "$domain"
+    mkdir -p "${SITES_ROOT}/${domain}/db"
+
+    write_nginx_bootstrap_conf "$domain"
+    docker exec webserver nginx -t
+    docker exec webserver nginx -s reload
+
+    issue_cert_bootstrap "$domain"
+
+    write_nginx_wp_conf "$domain" "wordpress-${service}"
+    write_compose_wp_yml "$domain" "$service" "$image"
+
+    compose_include_add "$domain"
+    webserver_deps_volumes_add "$domain" "wordpress-${service}" "1"
+
+    log "Піднімаю db-${service} і чекаю healthy ..."
+    docker compose up -d "db-${service}"
+    local tries=0
+    until [[ "$(docker inspect -f '{{.State.Health.Status}}' "db-${service}" 2>/dev/null)" == "healthy" ]]; do
+        sleep 3; tries=$((tries+1))
+        [[ $tries -gt 40 ]] && die "db-${service} не стала healthy за 2 хвилини — перевірте docker logs db-${service}"
+    done
+
+    log "Заповнюю web-теку файлами WordPress (${image}) ..."
+    docker run --rm -v "${SITES_ROOT}/${domain}/web:/target" "${image}" \
+        sh -c "cp -a /usr/src/wordpress/. /target/"
+
+    docker compose up -d "wordpress-${service}" "certbot-${service}"
+
+    nginx_test_and_reload
+
+    log "Готово. Відкрийте https://${domain}/wp-admin/install.php для завершення встановлення WordPress."
+    warn "Не забудьте після встановлення перевірити wp_options.siteurl/home (див. HOWTO-new-wordpress-site.md)."
+}
+
+cmd_del_site() {
+    local domain="$1"
+    local service; service="$(service_id "$domain")"
+    require_root_dir
+    [[ -f "${DOMAINS_YML_DIR}/${domain}.yml" ]] || die "${domain}.yml не знайдено."
+
+    confirm "Точно видалити сайт ${domain} (контейнери + volumes + БД + файли в ${SITES_ROOT}/${domain})?" \
+        || { log "Скасовано."; return; }
+
+    docker compose stop "wordpress-${service}" "db-${service}" "certbot-${service}" 2>/dev/null || true
+    docker compose rm -f "wordpress-${service}" "db-${service}" "certbot-${service}" 2>/dev/null || true
+    docker volume rm "docker-compose-project_wordpress-${service}" "docker-compose-project_db-${service}" 2>/dev/null || true
+
+    compose_include_remove "$domain"
+    webserver_deps_volumes_remove "$domain" "wordpress-${service}"
+
+    rm -f "${DOMAINS_YML_DIR}/${domain}.yml" "${NGINX_CONF_DIR}/nginx-${domain}.conf"
+
+    nginx_test_and_reload
+
+    if confirm "Прибрати також файли в ${SITES_ROOT}/${domain} (web+db)?"; then
+        sudo rm -rf "${SITES_ROOT:?}/${domain:?}"
+        log "Прибрано ${SITES_ROOT}/${domain}"
+    fi
+
+    log "Сайт ${domain} видалено. Сертифікат у certbot-etc НЕ видалявся автоматично (можна прибрати вручну)."
+}
+
+cmd_add_redirect_site() {
+    local alias="$1" target="$2"
+    local service; service="$(service_id "$alias")"
+
+    require_root_dir
+    [[ -f "${DOMAINS_YML_DIR}/${alias}.yml" ]] && die "${alias}.yml вже існує."
+
+    log "=== add-redirect-site: ${alias} -> ${target} (service=${service}) ==="
+
+    ensure_webroot_dir "$alias"
+
+    write_nginx_bootstrap_conf "$alias"
+    docker exec webserver nginx -t
+    docker exec webserver nginx -s reload
+
+    issue_cert_bootstrap "$alias"
+
+    write_nginx_redirect_conf "$alias" "$target"
+    write_redirect_index_html "$alias" "$target"
+    write_compose_redirect_yml "$alias" "$service"
+
+    compose_include_add "$alias"
+    webserver_deps_volumes_add "$alias" "redirect-${service}" "1"
+
+    docker compose up -d "redirect-${service}" "certbot-${service}"
+
+    nginx_test_and_reload
+
+    log "Готово: https://${alias}/ -> https://${target}/"
+}
+
+cmd_del_redirect_site() {
+    local alias="$1"
+    local service; service="$(service_id "$alias")"
+    require_root_dir
+    [[ -f "${DOMAINS_YML_DIR}/${alias}.yml" ]] || die "${alias}.yml не знайдено."
+
+    confirm "Видалити redirect-сайт ${alias}?" || { log "Скасовано."; return; }
+
+    docker compose stop "redirect-${service}" "certbot-${service}" 2>/dev/null || true
+    docker compose rm -f "redirect-${service}" "certbot-${service}" 2>/dev/null || true
+    docker volume rm "docker-compose-project_redirect-${service}" 2>/dev/null || true
+
+    compose_include_remove "$alias"
+    webserver_deps_volumes_remove "$alias" "redirect-${service}"
+
+    rm -f "${DOMAINS_YML_DIR}/${alias}.yml" "${NGINX_CONF_DIR}/nginx-${alias}.conf"
+
+    nginx_test_and_reload
+
+    if confirm "Прибрати також файли в ${SITES_ROOT}/${alias}?"; then
+        sudo rm -rf "${SITES_ROOT:?}/${alias:?}"
+    fi
+
+    log "Redirect-сайт ${alias} видалено."
+}
+
+cmd_add_proxy_site() {
+    local domain="$1" upstream="$2"
+    local service; service="$(service_id "$domain")"
+
+    require_root_dir
+    [[ -f "${DOMAINS_YML_DIR}/${domain}.yml" ]] && die "${domain}.yml вже існує."
+
+    log "=== add-proxy-site: ${domain} -> ${upstream} (service=${service}) ==="
+
+    ensure_webroot_dir "$domain"
+
+    write_nginx_bootstrap_conf "$domain"
+    docker exec webserver nginx -t
+    docker exec webserver nginx -s reload
+
+    issue_cert_bootstrap "$domain"
+
+    write_nginx_proxy_conf "$domain" "$upstream"
+    write_compose_proxy_yml "$domain" "$service"
+
+    compose_include_add "$domain"
+    webserver_deps_volumes_add "$domain" "" "0"
+
+    docker compose up -d "certbot-${service}"
+
+    nginx_test_and_reload
+
+    warn "Заготовку ${DOMAINS_YML_DIR}/${domain}.yml дозаповніть service-блоком застосунку"
+    warn "(image/volumes/environment), networks: [app-network], та підніміть його:"
+    warn "  docker compose up -d <ваш-сервіс>"
+    log "nginx вже проксіює https://${domain}/ -> http://${upstream}/"
+}
+
+cmd_del_proxy_site() {
+    local domain="$1"
+    local service; service="$(service_id "$domain")"
+    require_root_dir
+    [[ -f "${DOMAINS_YML_DIR}/${domain}.yml" ]] || die "${domain}.yml не знайдено."
+
+    confirm "Видалити проксі-сайт ${domain}? (сервіс застосунку, якщо є, доведеться зупинити вручну)" \
+        || { log "Скасовано."; return; }
+
+    docker compose stop "certbot-${service}" 2>/dev/null || true
+    docker compose rm -f "certbot-${service}" 2>/dev/null || true
+    docker volume rm "docker-compose-project_proxywebroot-${service}" 2>/dev/null || true
+
+    compose_include_remove "$domain"
+    webserver_deps_volumes_remove "$domain" ""
+
+    rm -f "${DOMAINS_YML_DIR}/${domain}.yml" "${NGINX_CONF_DIR}/nginx-${domain}.conf"
+
+    nginx_test_and_reload
+
+    log "Проксі-сайт ${domain} видалено (nginx-частина). Сервіс застосунку перевірте окремо."
+}
+
+# ───────────────────────── main ─────────────────────────
+
+usage() {
+    cat <<EOF
+dcpmgmt — керування доменами в docker-compose проєкті
+
+  dcpmgmt add-site <domain> [image]
+  dcpmgmt del-site <domain>
+  dcpmgmt add-redirect-site <alias> <target-domain>
+  dcpmgmt del-redirect-site <alias>
+  dcpmgmt add-proxy-site <domain> <upstream-host:port>
+  dcpmgmt del-proxy-site <domain>
+EOF
+}
+
+main() {
+    local cmd="${1:-}"; shift || true
+    case "$cmd" in
+        add-site)            [[ $# -ge 1 ]] || { usage; die "потрібен <domain>"; }; cmd_add_site "$@" ;;
+        del-site)             [[ $# -ge 1 ]] || { usage; die "потрібен <domain>"; }; cmd_del_site "$@" ;;
+        add-redirect-site)    [[ $# -ge 2 ]] || { usage; die "потрібні <alias> <target-domain>"; }; cmd_add_redirect_site "$@" ;;
+        del-redirect-site)    [[ $# -ge 1 ]] || { usage; die "потрібен <alias>"; }; cmd_del_redirect_site "$@" ;;
+        add-proxy-site)       [[ $# -ge 2 ]] || { usage; die "потрібні <domain> <upstream-host:port>"; }; cmd_add_proxy_site "$@" ;;
+        del-proxy-site)       [[ $# -ge 1 ]] || { usage; die "потрібен <domain>"; }; cmd_del_proxy_site "$@" ;;
+        *) usage; exit 1 ;;
+    esac
+}
+
+main "$@"
