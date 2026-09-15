@@ -41,7 +41,7 @@ server {
     root {{webroot}};
     index index.html index.htm;
 
-    include /etc/nginx/custom/{{domain}}.conf;
+    include /etc/nginx/custom/{{domain}}.conf*;
 
     location ~ /ads.txt {
         allow all;
