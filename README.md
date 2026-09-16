@@ -437,6 +437,7 @@ volume'ів, і неправильне значення змусить compose �
 двох файлах; `authenticator` і `webroot_path` у renewal-конфігах;
 працездатність спільного `certbot` і помилки в його свіжому логу;
 успадковані per-домен certbot-сервіси; єдиність `reuseport`;
+наявність `fastcgi_param HTTP_HOST $host` у vhost з `http3 = on`;
 узгодженість `quic_bpf`; права на секрети й майстер-ключ; паролі, що
 потрапили в git; версію WordPress проти тега образу; `docker compose
 config`.
@@ -637,8 +638,26 @@ prcDH6wjEcth81c313hf8RoKoR2QJIEBnFZbtbdHrqHIslyR
 
 ## HTTP/3 і QUIC
 
-HTTP/3 вмикається по-доменно (`http3` у реєстрі, типово `on`). Дві речі
-на рівні всього стека:
+HTTP/3 вмикається по-доменно (`http3` у реєстрі, типово `on`). Згенерований
+vhost слухає QUIC на обох сімействах адрес (`listen 443 quic` і
+`listen [::]:443 quic`) і віддає `Alt-Svc: h3=":443"; ma=3600`.
+
+**`HTTP_HOST` для php-fpm.** У HTTP/3 заголовка `Host` не існує — є
+псевдозаголовок `:authority`. nginx кладе його у `$host`, але змінна
+`$http_host`, з якої fastcgi формує `HTTP_HOST`, лишається порожньою.
+WordPress бере `HTTP_HOST` для canonical redirect і віддає `https:///`
+— браузер показує `ERR_INVALID_REDIRECT`. Тому шаблон WordPress явно
+передає `fastcgi_param HTTP_HOST $host;`, а `doctor` перевіряє, що цей
+рядок у vhost є. Перевірити руками:
+
+```bash
+curl -sS -o /dev/null -D - --http2      https://example.com/ | grep -i '^location'
+curl -sS -o /dev/null -D - --http3-only https://example.com/ | grep -i '^location'
+```
+
+Різна відповідь на однаковий запит — це саме воно.
+
+Ще дві речі на рівні всього стека:
 
 **`reuseport`** має стояти рівно в одному vhost — це вказується в
 `dcp.conf` (`quic_reuseport_domain`). Дублікат валить nginx із

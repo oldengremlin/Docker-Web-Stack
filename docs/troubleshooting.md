@@ -72,6 +72,46 @@ nginx резолвить імена з `fastcgi_pass`/`proxy_pass` **на ста
 випадок: proxy-домен, у якого `docker-compose.domains/<домен>.yml` ще з
 `CHANGE-ME` — такий файл свідомо не включається в стек.
 
+### `ERR_INVALID_REDIRECT` у Chrome, і тільки по HTTP/3
+
+Сайт відкривається, потім «через якийсь час» перестає. У Chrome —
+`ERR_INVALID_REDIRECT`, у `curl` по h1/h2 той самий URL віддає `200`:
+
+```
+$ curl -sS -o /dev/null -D - --http2 https://example.com/ | head -1
+HTTP/2 200
+$ curl -sS -o /dev/null -D - --http3-only https://example.com/ | grep -iE '^(HTTP|location)'
+HTTP/3 301
+location: https:///
+```
+
+`https:///` — порожній host, і це не помилка nginx. У HTTP/3 заголовка
+`Host` немає, є псевдозаголовок `:authority`; nginx кладе його у `$host`,
+але `$http_host` — а саме з нього fastcgi формує `HTTP_HOST` — лишається
+порожнім. WordPress бере `HTTP_HOST` для canonical redirect.
+
+«Через якийсь час» — це `Alt-Svc`: браузер спершу ходить по HTTP/2 і
+ловить поломку лише коли перемкнеться на h3. Перевірити, що саме
+закешував Chrome, — `chrome://net-internals/#alt-svc`.
+
+Сайт зі сторінковим кешем (WP Optimize й подібні) виглядає здоровим:
+на головній PHP не запускається взагалі. Поломка вилазить на
+`/wp-admin`, у залогіненого відвідувача, на POST і на URL із `?query`.
+
+Прямий доказ — покласти у webroot тимчасовий файл:
+
+```php
+<?php header('Content-Type: text/plain');
+printf("HTTP_HOST [%s]\n", $_SERVER['HTTP_HOST'] ?? '(unset)');
+```
+
+і смикнути його `--http2` та `--http3-only`.
+
+*Закрито в dcpmgmt:* шаблон WordPress передає
+`fastcgi_param HTTP_HOST $host;`, `doctor` перевіряє, що рядок на місці.
+Конфіги, згенеровані до 1.10.0, оновлюються через
+`dcpmgmt render --force <домен> && dcpmgmt apply`.
+
 ### HTTP/3 нібито увімкнений, а браузер ходить по HTTP/2
 
 QUIC — це UDP. Якщо в `ports` прокинуто тільки `443:443`, nginx всередині

@@ -6,6 +6,10 @@ server {
     listen [::]:80;
     server_name {{domain}};
 
+    # Порт 80 теж не має світити версію nginx: без цього рядка
+    # редіректна відповідь віддає "Server: nginx/1.29.3".
+    server_tokens off;
+
     location ~ /ads.txt {
         allow all;
         root {{webroot}};

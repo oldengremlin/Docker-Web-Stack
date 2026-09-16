@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.9.1';
+our $VERSION = '1.10.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -626,7 +626,10 @@ sub listen443_block {
         # показуючи при цьому на чужий файл (той, що вантажиться пізніше
         # за абеткою), а не на винуватця.
         my $ru = (lc($CFG{quic_reuseport_domain} // '') eq lc $d) ? ' reuseport' : '';
+        # reuseport — властивість конкретного сокета, тож 0.0.0.0:443
+        # і [::]:443 потребують його кожен окремо.
         push @l, "    listen 443 quic$ru;";
+        push @l, "    listen [::]:443 quic$ru;";
     }
     push @l, '    listen 443 ssl;';
     push @l, '    listen [::]:443 ssl;';
@@ -642,7 +645,12 @@ sub listen443_block {
 sub alt_svc_line {
     my ($e) = @_;
     return '' unless ($e->{http3} // 'on') eq 'on';
-    return qq{    add_header Alt-Svc 'h3=":443"; h3-29=":443"; ma=86400';\n};
+    # h3-29 (draft-29) nginx не вміє взагалі — рекламувати його означає
+    # посилати клієнта у версію, якої на сокеті немає.
+    # ma=3600, а не доба: якщо HTTP/3 зламається, клієнти відліпляться
+    # від нього за годину, а не за добу.
+    # always — щоб Alt-Svc був і у відповідях 4xx/5xx.
+    return qq{    add_header Alt-Svc 'h3=":443"; ma=3600' always;\n};
 }
 
 sub nginx_conf_path { my ($d) = @_; "$ROOT/nginx/nginx-$d.conf" }
@@ -1683,6 +1691,19 @@ sub cmd_doctor {
     } elsif (!@reuse && grep { $_->{http3} eq 'on' } @doms) {
         $soft->('жоден vhost не має reuseport на 443 — HTTP/3 працюватиме, але без розподілу '
               . 'QUIC-з\'єднань між воркерами (dcp.conf: quic_reuseport_domain)');
+    }
+
+    # HTTP/3 не має заголовка Host — лише псевдозаголовок :authority, тож
+    # $http_host (звідки fastcgi бере HTTP_HOST) порожній, і WordPress
+    # віддає canonical redirect на "https:///" — у Chrome це
+    # ERR_INVALID_REDIRECT. Конфіги, згенеровані до 1.10.0, рядка не мають.
+    for my $e (grep { $_->{type} eq 'wordpress' && $_->{http3} eq 'on' } @doms) {
+        my $body = nginx_uncommented(nginx_conf_path($e->{domain})) // next;
+        next if $body =~ /fastcgi_param\s+HTTP_HOST\s+\$host\s*;/;
+        $bad->("$e->{domain}: http3 = on, але у vhost немає "
+             . "'fastcgi_param HTTP_HOST \$host;' — по HTTP/3 WordPress віддасть "
+             . "редірект на 'https:///' (у Chrome ERR_INVALID_REDIRECT).\n"
+             . "       Полагодити: dcpmgmt render --force $e->{domain} && dcpmgmt apply");
     }
 
     say_step 'Паролі';
