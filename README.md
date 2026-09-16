@@ -389,7 +389,9 @@ volume'ів, і неправильне значення змусить compose �
 `certbot renew` і тримає lock у `/etc/letsencrypt` — `exec` у нього
 впаде з `Another instance of Certbot is already running`.
 
-**Ключі.** `--image` — інший образ WordPress. `--no-http3` — без QUIC.
+**Ключі.** `--image` — інший образ WordPress; має бути fpm-варіантом,
+бо nginx ходить у WordPress через `fastcgi_pass :9000`, а `wordpress:latest`
+— це апачевий образ і дасть 502. `--no-http3` — без QUIC.
 `--no-cert` — пропустити видачу (коли DNS ще не переведено); домен
 підніметься із заглушкою, сертифікат візьмете потім через `cert issue`.
 `--staging` — тестовий сервер Let's Encrypt, не витрачає лімітів.
@@ -438,6 +440,7 @@ volume'ів, і неправильне значення змусить compose �
 працездатність спільного `certbot` і помилки в його свіжому логу;
 успадковані per-домен certbot-сервіси; єдиність `reuseport`;
 наявність `fastcgi_param HTTP_HOST $host` у vhost з `http3 = on`;
+fpm-варіант образу WordPress;
 узгодженість `quic_bpf`; права на секрети й майстер-ключ; паролі, що
 потрапили в git; версію WordPress проти тега образу; `docker compose
 config`.

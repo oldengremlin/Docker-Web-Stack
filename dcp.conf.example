@@ -45,8 +45,19 @@ password_mode = derived
 # (зазвичай root, тобто /root/.dcp-master-key).
 master_key_file = ~/.dcp-master-key
 
-# Образи за замовчуванням для нових сайтів
-wordpress_image = wordpress:6.8.3-php8.4-fpm
+# Образи за замовчуванням для нових сайтів.
+#
+# wordpress_image ОБОВ'ЯЗКОВО має бути fpm-варіантом: nginx ходить у
+# WordPress через fastcgi_pass :9000. wordpress:latest — це апачевий
+# образ (той самий digest, що й wordpress:apache), він слухає HTTP на 80
+# і дасть 502. dcpmgmt перевіряє це і в add, і в doctor.
+#
+# Номера версії WordPress у тезі навмисно немає: ядро в web/ оновлює себе
+# саме через адмінку, а тег вирішує лише те, що розгорнеться в порожньому
+# каталозі — там свіже ядро доречніше за зафіксоване. Версія PHP, навпаки,
+# зафіксована: вона щодня виконує сайт, і стрибок мажорної версії тихо
+# ламає плагіни. Саме тому php8.4-fpm, а не просто fpm.
+wordpress_image = wordpress:php8.4-fpm
 db_image        = mariadb:latest
 nginx_image     = nginx:latest
 certbot_image   = certbot/certbot

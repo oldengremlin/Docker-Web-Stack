@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.10.0';
+our $VERSION = '1.11.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -68,7 +68,7 @@ my %CFG = (
     nginx_conf_dir  => '/var/sites/nginx-conf',
     letsencrypt_dir => '/var/sites/letsencrypt',
     certbot_email   => '',
-    wordpress_image => 'wordpress:6.8.3-php8.4-fpm',
+    wordpress_image => 'wordpress:php8.4-fpm',
     db_image        => 'mariadb:latest',
     nginx_image     => 'nginx:latest',
     certbot_image   => 'certbot/certbot',
@@ -1080,6 +1080,15 @@ sub cmd_init {
 TXT
 }
 
+# Стек ходить у WordPress через fastcgi_pass :9000, тож потрібен саме
+# fpm-варіант образу. wordpress:latest — це апачевий образ (той самий
+# digest, що й wordpress:apache): він слухає HTTP на 80 і про FastCGI не
+# знає, тож домен віддаватиме 502 одразу після apply.
+sub image_not_fpm {
+    my ($image) = @_;
+    return $image !~ m{(?:^|[:-])fpm(?:-|$)};
+}
+
 sub cmd_add {
     my @args = @_;
     my $type = shift @args // '';
@@ -1107,6 +1116,11 @@ sub cmd_add {
         if $target && !valid_domain($target);
 
     load_config();
+
+    die_err "--image '$image': стеку потрібен fpm-варіант образу "
+          . "(wordpress:php8.4-fpm). wordpress:latest — це апачевий образ, "
+          . "він не слухає FastCGI на :9000, і домен віддаватиме 502"
+        if $type eq 'wordpress' && $image && image_not_fpm($image);
 
     my $e = {
         domain => $d, type => $type, http3 => $http3, enabled => 'yes',
@@ -1580,6 +1594,12 @@ sub cmd_doctor {
                 $soft->("secrets/$d.env має права " . sprintf('%04o', $mode & 07777) . ', очікується 0600')
                     if ($mode & 07777) != 0600;
             }
+            $bad->("$d: образ $e->{image} — не fpm-варіант. nginx ходить у "
+                 . "WordPress через fastcgi_pass :9000, а апачевий образ слухає "
+                 . "HTTP на 80: домен віддасть 502. Потрібен, наприклад, "
+                 . "wordpress:php8.4-fpm")
+                if image_not_fpm($e->{image} // '');
+
             # Тег образу і встановлена версія розходяться самі собою: WordPress
             # оновлюється через власний апдейтер, а тег лишається старим.
             # Наявним файлам це не шкодить (entrypoint не чіпає непорожній
