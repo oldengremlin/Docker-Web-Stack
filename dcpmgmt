@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.11.2';
+our $VERSION = '1.12.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -705,6 +705,7 @@ sub domain_yml_body {
         upstream   => $e->{upstream} // '',
         app_service=> $e->{app_service} || upstream_host($e->{upstream} // ''),
         extra_env  => extra_env_lines($e),
+        php_ini    => php_ini_mounts($e),
     );
     return render_template('domain-wordpress.yml.tmpl', %v) if $e->{type} eq 'wordpress';
     return render_template('domain-proxy.yml.tmpl', %v);
@@ -730,6 +731,22 @@ sub extra_env_lines {
         my ($key, $value) = $pair =~ /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/ or next;
         push @lines, sprintf('      %s: "%s"', $key, $value);
     }
+    return @lines ? "\n" . join("\n", @lines) : '';
+}
+
+# PHP-налаштування домену живуть поруч із сайтом: усе, що лежить у
+# <sites_root>/<домен>/php/*.ini, монтується в conf.d контейнера. Це та
+# сама ідея, що й nginx/custom/<домен>.conf — правка переживає
+# render --force, і перелічувати її в реєстрі не треба.
+#
+# Файли монтуються поштучно, а не каталогом: монт каталогу поверх
+# conf.d сховав би те, що поклав туди образ (opcache, error-logging).
+# PHP читає conf.d за абеткою, тож файл, який має перекрити налаштування
+# образу, називають так, щоб він сортувався пізніше.
+sub php_ini_mounts {
+    my ($e) = @_;
+    my @lines = map { sprintf('      - %s:/usr/local/etc/php/conf.d/%s:ro', $_, basename($_)) }
+                sort glob("$CFG{sites_root}/$e->{domain}/php/*.ini");
     return @lines ? "\n" . join("\n", @lines) : '';
 }
 
@@ -1614,6 +1631,13 @@ sub cmd_doctor {
             # оновлюється через власний апдейтер, а тег лишається старим.
             # Наявним файлам це не шкодить (entrypoint не чіпає непорожній
             # каталог), але порожній каталог отримає версію з тега.
+            my $yml = slurp(domain_yml_path($d)) // '';
+            for my $ini (sort glob("$CFG{sites_root}/$d/php/*.ini")) {
+                next if index($yml, $ini) >= 0;
+                $soft->("$d: " . basename($ini) . " лежить у php/, але не змонтований — "
+                      . "PHP його не бачить. Полагодити: dcpmgmt render --force $d && dcpmgmt apply");
+            }
+
             my $installed = wp_installed_version($d);
             my ($tagged) = ($e->{image} // '') =~ /^wordpress:(\d+(?:\.\d+)*)/;
             $soft->("$d: у web/ стоїть WordPress $installed, а образ у реєстрі — "
