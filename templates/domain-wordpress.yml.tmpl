@@ -46,7 +46,7 @@ services:
     networks:
       - app-network
     healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -hlocalhost -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" --silent"]
+      test: ["CMD-SHELL", "{{db_ping}} ping -hlocalhost -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" --silent"]
       interval: 10s
       timeout: 20s
       retries: 10

@@ -3,6 +3,25 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/uk/1.1.0/),
 версіонування — [семантичне](https://semver.org/lang/uk/).
 
+## [1.11.1] — 2026-09-17
+
+### Виправлено
+
+- Healthcheck БД був намертво зашитий на `mariadb-admin`, тож домен із
+  `db_image = mysql:8.0` не піднімався взагалі: в образах MySQL такої
+  команди немає, healthcheck мовчки провалювався, а WordPress не стартував
+  через `depends_on: service_healthy` — з єдиною видимою ознакою
+  `container ... is unhealthy`. Клієнт тепер вибирається за образом
+  (`mysqladmin` для MySQL, `mariadb-admin` для MariaDB). Поле `db_image`
+  у реєстрі існувало й раніше, але скористатися ним для MySQL було
+  неможливо.
+
+  Навіщо взагалі MySQL: успадкований datadir від MySQL 8 під MariaDB не
+  відкривається — `Unsupported redo log format`. Це не питання пароля і не
+  пошкодження даних, просто різні двигуни на рівні файлів. Щоб підняти
+  такий сайт як є, домену задається `db_image = mysql:8.0`; переїзд на
+  MariaDB, якщо він потрібен, робиться окремо через `mysqldump`.
+
 ## [1.11.0] — 2026-09-16
 
 ### Додано
