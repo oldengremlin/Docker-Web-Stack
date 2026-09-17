@@ -821,14 +821,22 @@ docker logs webserver   # одразу, не відкладаючи
 
 ```bash
 sudo install -m 644 tools/dcpmgmt-completion.bash /etc/bash_completion.d/dcpmgmt
+exec bash
 ```
 
-Або лише для себе, без root:
+`exec bash` тут не формальність: у вже відкритій сесії нічого не зміниться.
+Коли bash уперше не знаходить completion для команди, він реєструє для неї
+`_minimal` — доповнення імен файлів — і в цій сесії більше не шукає. Тобто
+якщо ви встигли натиснути Tab після `dcpmgmt` до встановлення, далі
+пропонуватимуться файли з каталогу, хоч би що лежало на диску.
 
-```bash
-install -Dm 644 tools/dcpmgmt-completion.bash \
-    ~/.local/share/bash-completion/completions/dcpmgmt
-```
+З тієї ж причини не варто класти файл у `~/.local/share/bash-completion/
+completions/`: цей каталог — лінивий, і з нього підвантажується лише те,
+чого bash ще не встиг позначити як «немає completion».
+
+Для `sudo ./dcpmgmt …` потрібен пакет `bash-completion`: саме він підставляє
+обгортку, яка відкидає `sudo` і шукає completion для наступного слова.
+Перевірити — `type -t _completion_loader`, має бути `function`.
 
 Доповнює команди, ключі та **імена доменів** — останнє й було приводом:
 `xn----stbbijjt.xn--j1amh` руками набирають з одруківкою, а `render`

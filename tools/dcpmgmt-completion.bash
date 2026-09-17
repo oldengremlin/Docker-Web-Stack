@@ -1,9 +1,16 @@
 # bash-completion для dcpmgmt.
 #
-# Встановлення (одне з):
+# Встановлення:
 #   sudo install -m 644 tools/dcpmgmt-completion.bash /etc/bash_completion.d/dcpmgmt
-#   install -Dm 644 tools/dcpmgmt-completion.bash \
-#       ~/.local/share/bash-completion/completions/dcpmgmt
+#   exec bash        # обов'язково: у відкритій сесії нічого не зміниться
+#
+# Саме /etc/bash_completion.d/, а не ~/.local/share/bash-completion/
+# completions/: другий каталог — лінивий, файл із нього підвантажується
+# лише коли bash уперше не знайде completion для команди. А після першої
+# невдалої спроби bash-completion реєструє для неї _minimal (доповнення
+# імен файлів) на всю сесію — і більше туди не загляне. Тобто якщо ви в
+# цій сесії вже набирали `dcpmgmt` з Tab, ліниве встановлення не спрацює
+# до нового входу.
 #
 # Імена доменів беруться з `dcpmgmt list --names` — тією ж копією
 # інструмента, яку ви набрали в рядку. Тобто працює лише в каталозі
