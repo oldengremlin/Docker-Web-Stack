@@ -501,6 +501,7 @@ volume'ів, і неправильне значення змусить compose �
 двох файлах; `authenticator` і `webroot_path` у renewal-конфігах;
 працездатність спільного `certbot` і помилки в його свіжому логу;
 успадковані per-домен certbot-сервіси; єдиність `reuseport`;
+сторонні конфіги в `nginx_conf_dir`;
 наявність `fastcgi_param HTTP_HOST $host` у vhost з `http3 = on`;
 fpm-варіант образу WordPress;
 узгодженість `quic_bpf`; права на секрети й майстер-ключ; паролі, що

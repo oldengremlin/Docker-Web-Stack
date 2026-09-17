@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.12.0';
+our $VERSION = '1.13.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -425,12 +425,39 @@ sub container_running {
     return grep { $_ eq $name } split /\n/, $out;
 }
 
+# `docker ps` показує і контейнер у стані restarting, тож самої лише
+# присутності в списку мало: exec у контейнер, який щойно вмер, падає
+# помилкою runc ("failed to open /proc/.../ns/ipc"), і це легко прийняти
+# за провал nginx -t, хоч перевірка навіть не запускалася.
+sub container_state {
+    my ($name) = @_;
+    my $out = capture('docker', 'inspect', '-f', '{{.State.Status}}', $name) // '';
+    chomp $out;
+    return $out;   # running | restarting | exited | created | '' (немає)
+}
+
 sub nginx_test_reload {
-    unless (container_running('webserver')) {
+    my $state = container_state('webserver');
+
+    if ($state eq '' || $state eq 'created') {
         say_warn 'контейнер webserver не запущено — nginx -t пропущено';
         return 0;
     }
+    # Тут немає "старої конфігурації в пам'яті", якою можна втішати: nginx
+    # не піднявся взагалі, отже сайти цього стека зараз недоступні.
+    if ($state ne 'running') {
+        die_err "webserver не працює (стан: $state) — nginx не стартував, і сайти\n"
+              . "       цього стека зараз недоступні. nginx -t тут не допоможе:\n"
+              . "       причину видно тільки в логах контейнера.\n"
+              . "       Дивіться: docker logs webserver --tail 30";
+    }
+
     unless (run('docker', 'exec', 'webserver', 'nginx', '-t')) {
+        my $now = container_state('webserver');
+        die_err "webserver перестав працювати (стан: $now) — nginx -t не виконався\n"
+              . "       взагалі, тож про конфігурацію це нічого не каже.\n"
+              . "       Дивіться: docker logs webserver --tail 30"
+            if $now ne 'running';
         die_err "nginx -t не пройшов. Конфігурацію НЕ перезавантажено, працюючий nginx\n"
               . "       далі крутиться зі старою конфігурацією в пам'яті — сайти живі.\n"
               . "       Полагодьте конфіг і повторіть: dcpmgmt apply";
@@ -450,7 +477,9 @@ sub nginx_test_reload {
 # конфіг просто не дасть йому піднятись.
 sub preflight_nginx {
     my (@doms) = @_;
-    return 1 unless have_docker() && container_running('webserver');
+    return 1 unless have_docker();
+    my $state = container_state('webserver');
+    return 1 unless $state eq 'running' || $state eq 'restarting';
 
     my $network = "$CFG{project}_app-network";
     unless (grep { $_ eq $network } split /\n/, capture('docker', 'network', 'ls', '--format', '{{.Name}}')) {
@@ -1738,6 +1767,20 @@ sub cmd_doctor {
     }
 
     say_step 'nginx';
+    # nginx_conf_dir монтується в /etc/nginx/conf.d цілком, тож усе, що
+    # там лежить, nginx вантажить як свою конфігурацію — нарівні з
+    # vhost-ами, які цей стек монтує поштучно. Успадкований монолітний
+    # конфіг від попередньої інсталяції кладе таким чином увесь webserver,
+    # причому в помилці згадується чужий upstream, а не файл-винуватець.
+    my %ours = map { $_ => 1 } map { nginx_conf_path($_->{domain}) } @doms;
+    my @stray = grep { -f $_ && !$ours{$_} } glob("$CFG{nginx_conf_dir}/*.conf");
+    if (@stray) {
+        $soft->("$CFG{nginx_conf_dir} містить конфіги, які nginx вантажить разом зі "
+              . 'згенерованими: ' . join(', ', map { basename($_) } @stray));
+        $soft->('якщо це спадок попередньої інсталяції — приберіть каталог убік; '
+              . 'vhost-и цього стека туди не кладуться, вони монтуються з nginx/');
+    }
+
     my @reuse = grep { (nginx_uncommented($_) // '') =~ /reuseport/ } glob("$ROOT/nginx/nginx-*.conf");
     if (@reuse > 1) {
         $bad->('reuseport на 443 більш ніж в одному vhost — nginx впаде з "duplicate listen options": '
