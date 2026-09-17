@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.16.0';
+our $VERSION = '1.17.0';
 
 my $ROOT = dirname(abs_path($0));
 
