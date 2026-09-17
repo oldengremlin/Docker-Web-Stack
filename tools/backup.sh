@@ -8,6 +8,11 @@
 #
 set -euo pipefail
 
+# xz однопотоковий за замовчуванням, і саме він розтягує архівацію на
+# хвилини — а чим довше читається web/, тим більше шансів, що
+# WordPress щось у ньому перепише просто під час читання.
+export XZ_OPT="${XZ_OPT:--T0}"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -38,14 +43,33 @@ for domain in $(./dcpmgmt list --names --type wordpress); do
         'exec mariadb-dump -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" \
             --add-drop-table --complete-insert --single-transaction \
             --order-by-primary --dump-date "$MYSQL_DATABASE"' \
-        | xz -z9 > "$DEST/db.$domain.sql.xz"
+        | xz > "$DEST/db.$domain.sql.xz"
 done
 
 # ── файли сайтів ──
+# Кеші й тимчасові каталоги не бекапимо: вони відновлюються самі, важать
+# найбільше і змінюються найчастіше — тобто рівно вони й перетворюють
+# архівацію на гонитву за рухомою ціллю.
+WEB_EXCLUDE=(
+    --exclude='web/wp-content/cache'
+    --exclude='web/wp-content/wpo-cache'
+    --exclude='web/wp-content/uploads/cache'
+    --exclude='web/wp-content/upgrade'
+    --exclude='web/wp-content/debug.log'
+)
+
 for domain in $(./dcpmgmt list --names); do
     [ -d "$SITES_ROOT/$domain/web" ] || continue
     echo "архів web: $domain"
-    tar cJf "$DEST/web.$domain.tar.xz" -C "$SITES_ROOT/$domain" web
+    # tar повертає 1, коли файл змінився під час читання. На живому сайті
+    # це норма, архів при цьому цілий — валити через це весь бекап (а з
+    # set -e саме так і буде) означає втратити ще й конфігурацію нижче.
+    # Фатальним лишається код 2 і вище.
+    rc=0
+    tar "${WEB_EXCLUDE[@]}" -cJf "$DEST/web.$domain.tar.xz" \
+        -C "$SITES_ROOT/$domain" web || rc=$?
+    [ "$rc" -le 1 ] || exit "$rc"
+    [ "$rc" -eq 0 ] || echo "  увага: файли змінювалися під час читання — архів цілий, але зріз неатомарний" >&2
 done
 
 # ── конфігурація стека (без secrets/ — вони бекапляться окремо й інакше) ──
