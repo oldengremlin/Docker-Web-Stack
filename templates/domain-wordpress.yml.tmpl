@@ -18,7 +18,7 @@ services:
       WORDPRESS_DB_USER: {{db_user}}
       WORDPRESS_DB_NAME: {{db_name}}{{extra_env}}
     volumes:
-      - wordpress-{{sid}}:/var/www/html/{{domain}}
+      - wordpress-{{sid}}:/var/www/html/{{domain}}{{php_ini}}
     depends_on:
       db-{{sid}}:
         condition: service_healthy
