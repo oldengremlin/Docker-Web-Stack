@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.13.0';
+our $VERSION = '1.14.0';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -1389,6 +1389,78 @@ sub cmd_apply {
     say_ok 'готово';
 }
 
+# ────────────────────── життєвий цикл контейнерів ──────────────────────
+#
+# up/down/restart — це про ЖИВІ контейнери, а не про склад стека. Нічого
+# не генерується й не перезаписується: змінити склад — це apply.
+
+# Контейнери, якими керують up/down/restart. Redirect-домен не має їх
+# зовсім: він живе рядками в nginx-конфізі.
+sub domain_services {
+    my ($e) = @_;
+    return ('db-' . sid_of($e->{domain}), 'wordpress-' . sid_of($e->{domain}))
+        if $e->{type} eq 'wordpress';
+    return ($e->{app_service}) if $e->{type} eq 'proxy' && $e->{app_service};
+    return ();
+}
+
+sub cmd_lifecycle {
+    my ($action, @args) = @_;
+    load_config();
+    my $d = lc(shift(@args) // '');
+
+    my %verb = (up => 'піднімаємо', down => 'зупиняємо', restart => 'перезапускаємо');
+
+    unless ($d) {
+        say_step "$verb{$action}: весь стек";
+        # down на весь стек — це саме `compose down`: контейнери зникають
+        # разом із мережею проєкту. Не `network prune`, який вимів би й
+        # чужі невживані мережі на цьому хості. Дані не страждають: усі
+        # volume'и названі й bind-backed, а `-v` стосується лише анонімних,
+        # яких у наших шаблонах немає.
+        my @cmd = $action eq 'up'   ? ('up', '-d')
+                : $action eq 'down' ? ('down', '--remove-orphans')
+                :                     ('restart');
+        if ($action eq 'down') {
+            say_warn 'зупиняться ВСІ домени цього стека разом з nginx — сайти стануть недоступні';
+            return say_info 'скасовано' unless confirm('Зупинити весь стек?');
+        }
+        compose(@cmd) or die_err "docker compose $cmd[0] завершився помилкою";
+        # Після down стека nginx уже немає — перевіряти конфіг нема кому.
+        nginx_test_reload() unless $action eq 'down';
+        say_ok 'готово';
+        return;
+    }
+
+    my $e = reg_load_one($d) or die_err "домену $d немає в реєстрі (domains/$d.conf)";
+    my @svc = domain_services($e);
+    unless (@svc) {
+        say_info "$d — тип $e->{type}: власних контейнерів не має зовсім, "
+               . 'він живе рядками в nginx-конфізі.';
+        say_info 'перезапускати тут нічого; змінити його — render, потім apply';
+        return;
+    }
+
+    if ($action eq 'down') {
+        say_warn "поки $d зупинений, nginx віддаватиме на ньому 502 — решта сайтів працює";
+        say_warn 'render і apply у цей час спотикатимуться на перевірці конфігу: '
+               . 'nginx не резолвить зупинений upstream';
+        return say_info 'скасовано' unless confirm("Зупинити $d?");
+    }
+
+    say_step "$verb{$action}: $d (" . join(', ', @svc) . ')';
+    my @cmd = $action eq 'up'   ? ('up', '-d', @svc)
+            : $action eq 'down' ? ('stop', @svc)
+            :                     ('restart', @svc);
+    compose(@cmd) or die_err "docker compose $cmd[0] завершився помилкою";
+
+    # nginx резолвить fastcgi_pass і proxy_pass на старті воркерів і тримає
+    # адресу до наступного reload. Перестворений контейнер отримує іншу IP,
+    # і без reload nginx стукає у стару — 502 на домені, який щойно підняли.
+    nginx_test_reload() unless $action eq 'down';
+    say_ok 'готово';
+}
+
 # ─────────────────────────── import ───────────────────────────
 #
 # Успадкована інсталяція: стек уже працює, реєстру ще немає. Збираємо
@@ -1925,6 +1997,11 @@ dcpmgmt — керування доменами docker web-стека (nginx + W
   dcpmgmt doctor                        перевірити узгодженість усього
   dcpmgmt render [--diff] [--force] [<domain>...]   перегенерувати файли
   dcpmgmt apply [--force]               застосувати до працюючого стека
+
+  dcpmgmt up      [<domain>]            підняти стек або контейнери домену
+  dcpmgmt down    [<domain>]            зупинити те саме
+  dcpmgmt restart [<domain>]            перезапустити те саме
+
   dcpmgmt cert issue|renew|list [<domain>] [--staging] [--force] [--dry-run]
   dcpmgmt secrets show <domain> | restore | key
 
@@ -1949,6 +2026,9 @@ sub main {
         || $cmd eq 'ls')      { cmd_list(@args) }
     elsif ($cmd eq 'render')  { cmd_render(@args) }
     elsif ($cmd eq 'apply')   { cmd_apply(@args) }
+    elsif ($cmd eq 'up'
+        || $cmd eq 'down'
+        || $cmd eq 'restart') { cmd_lifecycle($cmd, @args) }
     elsif ($cmd eq 'cert')    { cmd_cert(@args) }
     elsif ($cmd eq 'secrets') { cmd_secrets(@args) }
     elsif ($cmd eq 'doctor')  { cmd_doctor(@args) }
