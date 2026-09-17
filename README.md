@@ -824,8 +824,7 @@ docker logs webserver   # одразу, не відкладаючи
 інсталяцію, не забувши жодної частини:
 
 ```bash
-cd ~/src/Docker-Web-Stack && git pull
-tools/deploy.sh ../docker-compose-project
+cd ~/src/Docker-Web-Stack && tools/deploy.sh ../docker-compose-project
 ```
 
 Або з протилежного боку, якщо ви вже в інсталяції:
@@ -833,6 +832,20 @@ tools/deploy.sh ../docker-compose-project
 ```bash
 ../Docker-Web-Stack/tools/deploy.sh .
 ```
+
+`git pull --ff-only` у клоні робиться сам — по цей скрипт приходять саме
+за оновленням. Вимкнути: `--no-pull`. Своє умовчання задається змінною
+оточення, а ключ у рядку команди її перекриває:
+
+```bash
+export DCP_DEPLOY=--no-pull          # типово не тягнути
+tools/deploy.sh --pull ../docker-compose-project   # але цього разу так
+```
+
+`pull` пропускається — із повідомленням, але без зупинки, — якщо клон не
+є git-репозиторієм або має незакомічені зміни. Злиття робиться лише
+`--ff-only`: мовчазний merge-комміт у вашому клоні не та річ, по яку сюди
+приходять.
 
 Скрипт копіює `dcpmgmt`, `templates/*.tmpl` і `tools/*` — і більше
 нічого. `domains/`, `secrets/`, `dcp.conf`, `nginx/` та згенеровані
