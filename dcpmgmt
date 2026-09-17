@@ -25,7 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use Digest::SHA qw(hmac_sha512);
 use MIME::Base64 qw(encode_base64);
 
-our $VERSION = '1.11.0';
+our $VERSION = '1.11.1';
 
 my $ROOT = dirname(abs_path($0));
 
@@ -699,6 +699,7 @@ sub domain_yml_body {
         sites_root => $CFG{sites_root},
         wp_image   => $e->{image}    || $CFG{wordpress_image},
         db_image   => $e->{db_image} || $CFG{db_image},
+        db_ping    => db_ping_cmd($e->{db_image} || $CFG{db_image}),
         db_name    => $e->{db_name}  || db_name_of($d),
         db_user    => $e->{db_user}  || db_user_of($d),
         upstream   => $e->{upstream} // '',
@@ -707,6 +708,15 @@ sub domain_yml_body {
     );
     return render_template('domain-wordpress.yml.tmpl', %v) if $e->{type} eq 'wordpress';
     return render_template('domain-proxy.yml.tmpl', %v);
+}
+
+# Клієнт для healthcheck залежить від того, що за СУБД в образі: MariaDB
+# з 11.x перейменувала mysqladmin на mariadb-admin, а в образах MySQL
+# mariadb-admin немає взагалі — healthcheck мовчки провалюється, і
+# WordPress не стартує через depends_on: service_healthy.
+sub db_ping_cmd {
+    my ($image) = @_;
+    return $image =~ m{^(?:.*/)?mysql[:@]} ? 'mysqladmin' : 'mariadb-admin';
 }
 
 # Додаткові змінні оточення WordPress-контейнера, яких немає в схемі:
